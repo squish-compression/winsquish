@@ -18,8 +18,10 @@
  * winsquish.cpp — Windows GUI front end for libsquish
  *
  * A small WinRAR-style utility: pick (or drop) a file, compress it to .sq or
- * extract a .sq stream, with live progress. Installs optional per-user
- * Explorer context-menu entries:
+ * extract a .sq stream, with live progress. "View Files…" opens an archive in
+ * a browsable window — navigate its folders and extract just the files or
+ * folders you select, WinRAR-style. Installs optional per-user Explorer
+ * context-menu entries:
  *
  *   any file  ->  "Compress to .sq (WinSquish)"
  *   any file  ->  "Compress to self-extracting .exe (WinSquish)"
@@ -43,6 +45,7 @@
  *   winsquish.exe --compress <file>      open GUI and start compressing (.sq)
  *   winsquish.exe --compress-sfx <file>  open GUI and build a .exe SFX
  *   winsquish.exe --decompress <file>    open GUI and extract (.sq or SFX)
+ *   winsquish.exe --view <file>          open the archive browser (.sq or SFX)
  *   winsquish.exe --register             install context-menu entries (HKCU)
  *   winsquish.exe --unregister           remove them
  *   winsquish.exe --register --quiet     as above, but no confirmation dialog
@@ -63,6 +66,7 @@
 #include <string.h>
 #include <vector>
 #include <algorithm>
+#include <set>
 
 #include "../squish/squish.h"
 #include "resource.h"
@@ -92,6 +96,14 @@ static const wchar_t *SQ_EXT     = L".sq";
 #define IDC_PROGRESS     1007
 #define IDC_STATUS       1008
 #define IDC_SFX_CHECK    1009
+#define IDC_VIEW_BTN     1010
+
+/* archive-browser window control IDs */
+#define IDC_LV           1101
+#define IDC_UP_BTN       1102
+#define IDC_EXTRACT_SEL  1103
+#define IDC_EXTRACT_ALL  1104
+#define IDC_PATH_STATIC  1105
 
 /* menu IDs */
 #define IDM_OPEN         2001
@@ -113,6 +125,8 @@ struct Job {
     bool         compress;   /* true = compress, false = extract              */
     bool         sfx;        /* compress: build .exe SFX; extract: src is SFX */
     bool         srcIsDir;   /* compress: source is a folder (SQAR archive)   */
+    bool         listing;    /* true = decompress into `blob` for the browser */
+    std::string  blob;       /* listing: the decompressed archive bytes       */
     int          threads;    /* worker count; 1 = single-block (best ratio)   */
     volatile LONG lastPct;
 };
@@ -667,6 +681,55 @@ static int UnpackArchive(const unsigned char *b, size_t len,
     return SQUISH_OK;
 }
 
+/* One entry of an archive as seen by the browser: its archive-relative path
+ * ('/'-separated, no trailing slash), whether it is a directory, and — for a
+ * file — where its bytes live inside the decompressed buffer. */
+struct ArcEntry {
+    std::wstring path;
+    bool         isDir;
+    uint64_t     dataOff;   /* offset of the file's bytes within the blob     */
+    uint64_t     dataLen;
+};
+
+/* Enumerate the entries of a validated SQAR buffer WITHOUT writing anything to
+ * disk — the browser's read-only view of the archive. Same parsing and safety
+ * checks as UnpackArchive; `dataOff` points into `b`, so the buffer must stay
+ * alive for as long as the returned entries are used. */
+static int ListArchiveEntries(const unsigned char *b, size_t len,
+                              std::vector<ArcEntry> *out) {
+    if (!IsArchive(b, len)) return SQUISH_E_FORMAT;
+    uint64_t count = GetU64LE(b + 16);
+    size_t off = SQAR_HDR_LEN;
+    out->clear();
+    for (uint64_t i = 0; i < count; i++) {
+        if (len - off < SQAR_ENT_LEN) return SQUISH_E_FORMAT;
+        unsigned char type = b[off];
+        uint32_t plen = GetU32LE(b + off + 5);
+        uint64_t dlen = GetU64LE(b + off + 9);
+        off += SQAR_ENT_LEN;
+        if (plen == 0 || plen > SQAR_MAX_PATH || plen > len - off)
+            return SQUISH_E_FORMAT;
+        const char *path = (const char *)(b + off);
+        if (!ArcPathSafe(path, plen)) return SQUISH_E_FORMAT;
+        ArcEntry e;
+        e.path = FromUtf8(path, (int)plen);       /* keep '/' separators */
+        off += plen;
+        if (type == 1) {                                   /* directory */
+            if (dlen != 0) return SQUISH_E_FORMAT;
+            e.isDir = true; e.dataOff = 0; e.dataLen = 0;
+        } else if (type == 0) {                            /* regular file */
+            if (dlen > len - off) return SQUISH_E_FORMAT;
+            e.isDir = false; e.dataOff = off; e.dataLen = dlen;
+            off += (size_t)dlen;
+        } else {
+            return SQUISH_E_FORMAT;
+        }
+        out->push_back(std::move(e));
+    }
+    if (off != len) return SQUISH_E_FORMAT;
+    return SQUISH_OK;
+}
+
 /* --- context-menu registration (Software\Classes) --------------------------
  * Registration is written under one of two roots:
  *   HKEY_CURRENT_USER  — a per-user install: no admin rights, this user only.
@@ -724,12 +787,17 @@ static bool RegisterShell(HKEY root) {
     ok &= SetRegValue(root,L"Software\\Classes\\" + std::wstring(SQ_EXT),
                       nullptr, PROGID);
 
-    /* ProgID: icon, double-click opens GUI, "Extract" verb */
+    /* ProgID: icon, double-click opens GUI, "View files" + "Extract" verbs */
     std::wstring p = L"Software\\Classes\\" + std::wstring(PROGID);
     ok &= SetRegValue(root,p, nullptr, L"SQUISH Compressed File");
     ok &= SetRegValue(root,p + L"\\DefaultIcon", nullptr, quoted + L",0");
     ok &= SetRegValue(root,p + L"\\shell\\open\\command", nullptr,
                       quoted + L" \"%1\"");
+    ok &= SetRegValue(root,p + L"\\shell\\view", nullptr,
+                      L"View files with WinSquish");
+    ok &= SetRegValue(root,p + L"\\shell\\view", L"Icon", quoted);
+    ok &= SetRegValue(root,p + L"\\shell\\view\\command", nullptr,
+                      quoted + L" --view \"%1\"");
     ok &= SetRegValue(root,p + L"\\shell\\extract", nullptr,
                       L"Extract with WinSquish");
     ok &= SetRegValue(root,p + L"\\shell\\extract", L"Icon", quoted);
@@ -848,10 +916,39 @@ static int SfxExtract(Job *job) {
                          payload.size());
 }
 
+/* Decompress the whole of job->src (a .sq stream or any-platform SFX) into
+ * `out`, without unpacking it — the raw bytes the browser enumerates. The SFX
+ * vs. plain distinction is re-detected here so it does not depend on job flags. */
+static int DecompressArchiveBlob(Job *job, std::string *out) {
+    std::string comp;
+    SfxInfo info;
+    if (ProbeSfx(job->src, &info)) {
+        if (!ReadRange(job->src, info.payloadOff, info.payloadLen, &comp))
+            return SQUISH_E_IO;
+    } else if (!ReadWholeFile(job->src, &comp)) {
+        return SQUISH_E_IO;
+    }
+    void *raw = nullptr; size_t rn = 0;
+    int rc = squish_decompress_alloc_mt((const unsigned char *)comp.data(),
+                                        comp.size(), &raw, &rn, job->threads,
+                                        SquishProgress, job);
+    if (rc != SQUISH_OK) return rc;
+    out->assign((const char *)raw, rn);
+    squish_free(raw);
+    return SQUISH_OK;
+}
+
+/* Open the archive browser for `archivePath`, taking ownership of its already
+ * decompressed bytes. Defined below, near the browser window code. */
+static void OpenBrowser(const std::wstring &archivePath, std::string blob,
+                        int threads);
+
 static DWORD WINAPI WorkerProc(LPVOID param) {
     Job *job = (Job *)param;
     int rc;
-    if (job->compress) {
+    if (job->listing) {
+        rc = DecompressArchiveBlob(job, &job->blob);
+    } else if (job->compress) {
         rc = job->sfx ? SfxCompress(job) : CompressToStream(job, job->dst);
     } else if (job->sfx) {
         rc = SfxExtract(job);
@@ -930,7 +1027,7 @@ static void UpdateFileInfo(void) {
 static void SetBusy(bool busy) {
     g_busy = busy;
     for (int id : { IDC_FILE_EDIT, IDC_BROWSE_BTN, IDC_CPU_COMBO, IDC_SFX_CHECK,
-                    IDC_COMPRESS_BTN, IDC_EXTRACT_BTN })
+                    IDC_COMPRESS_BTN, IDC_EXTRACT_BTN, IDC_VIEW_BTN })
         EnableWindow(GetDlgItem(g_hwnd, id), !busy);
     if (!busy)
         SendDlgItemMessageW(g_hwnd, IDC_PROGRESS, PBM_SETPOS, 0, 0);
@@ -1018,7 +1115,7 @@ static void StartJob(bool compress) {
     }
 
     g_job = new Job{ g_hwnd, src, dst, compress, sfx, srcIsDir,
-                     SelectedThreads(), -1 };
+                     false, std::string(), SelectedThreads(), -1 };
     g_t0 = GetTickCount64();
     SetBusy(true);
     SetStatus(compress ? (sfx ? L"Building self-extracting archive…"
@@ -1034,11 +1131,70 @@ static void StartJob(bool compress) {
     CloseHandle(th);
 }
 
+/* "View Files": decompress the selected archive into memory (on the worker
+ * thread, with progress) and, when done, open the browser window. The archive
+ * must be a .sq stream or a self-extracting .exe — a raw folder/file is not. */
+static void StartView(void) {
+    if (g_busy) return;
+    wchar_t buf[MAX_PATH];
+    GetDlgItemTextW(g_hwnd, IDC_FILE_EDIT, buf, MAX_PATH);
+    std::wstring src = buf;
+    if (src.empty()) {
+        MessageBoxW(g_hwnd, L"Choose a .sq or self-extracting archive first.",
+                    APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    if (IsDirectory(src) || FileSize(src) < 0) {
+        MessageBoxW(g_hwnd,
+            L"Choose an existing .sq stream or self-extracting archive to view.",
+            APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    SfxInfo si; uint64_t orig;
+    if (!ProbeSfx(src, &si) && !ReadSqHeader(src, &orig)) {
+        MessageBoxW(g_hwnd,
+            L"This file is not a SQUISH stream or self-extracting archive, so "
+            L"its contents cannot be listed.", APP_NAME, MB_ICONERROR);
+        return;
+    }
+    g_job = new Job{ g_hwnd, src, std::wstring(), false, false, false,
+                     true, std::string(), SelectedThreads(), -1 };
+    g_t0 = GetTickCount64();
+    SetBusy(true);
+    SetStatus(L"Reading archive…");
+    HANDLE th = CreateThread(nullptr, 0, WorkerProc, g_job, 0, nullptr);
+    if (!th) {
+        SetBusy(false);
+        delete g_job; g_job = nullptr;
+        SetStatus(L"Failed to start worker thread.");
+        return;
+    }
+    CloseHandle(th);
+}
+
 static void OnJobDone(int rc) {
     Job *job = g_job; g_job = nullptr;
     double secs = (GetTickCount64() - g_t0) / 1000.0;
     SetBusy(false);
     if (!job) return;
+
+    /* "View Files" job: hand the decompressed bytes to the browser window. */
+    if (job->listing) {
+        if (rc != SQUISH_OK) {
+            wchar_t err[128];
+            MultiByteToWideChar(CP_UTF8, 0, squish_strerror(rc), -1, err, 128);
+            SetStatus(std::wstring(L"Failed to read archive: ") + err);
+            MessageBoxW(g_hwnd,
+                (std::wstring(L"Could not read this archive:\n") + err).c_str(),
+                APP_NAME, MB_ICONERROR);
+        } else {
+            SendDlgItemMessageW(g_hwnd, IDC_PROGRESS, PBM_SETPOS, 100, 0);
+            SetStatus(L"Archive opened for browsing.");
+            OpenBrowser(job->src, std::move(job->blob), job->threads);
+        }
+        delete job;
+        return;
+    }
 
     if (rc != SQUISH_OK) {
         wchar_t err[128];
@@ -1167,6 +1323,457 @@ static void ShowAbout(void) {
 static int g_dpi = 96;
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
 
+/* ============================================================================
+ * Archive browser — a WinRAR-style window listing the contents of an archive
+ *
+ * Opening an archive decompresses its whole stream once into memory (the slow
+ * part, done on the worker thread). This window then presents that buffer as a
+ * navigable tree: double-click folders to descend, "Up" to ascend, and extract
+ * either the current selection or everything. Extraction just copies bytes out
+ * of the already-decompressed blob, so it is instant — no re-decompression.
+ * ==========================================================================*/
+static const wchar_t *BROWSER_CLASS = L"WinSquishBrowserWindow";
+
+/* One row of the current folder view (a child of the browser's cwd). */
+struct ViewRow {
+    std::wstring name;      /* leaf name shown in the Name column            */
+    std::wstring fullPath;  /* archive-relative '/'-path, no trailing slash  */
+    bool         isDir;
+    bool         isUp;      /* the synthetic ".." row                        */
+    uint64_t     size;
+    int          entryIndex;/* index into Browser::entries (files); else -1  */
+};
+
+struct Browser {
+    std::wstring          archivePath;   /* source .sq / .exe               */
+    std::string           blob;          /* decompressed archive bytes       */
+    std::vector<ArcEntry> entries;       /* every entry (dataOff into blob)  */
+    std::wstring          cwd;           /* "" (root) or "a/b/" with slash   */
+    int                   threads;
+    int                   sortCol;       /* 0 = name, 1 = size               */
+    bool                  sortAsc;
+    std::vector<ViewRow>  view;          /* rows currently shown             */
+    HWND                  hwnd;
+    HWND                  hlist;
+};
+
+static bool StartsWith(const std::wstring &s, const std::wstring &pfx) {
+    return s.size() >= pfx.size() &&
+           wcsncmp(s.c_str(), pfx.c_str(), pfx.size()) == 0;
+}
+
+/* The system image list (small icons), so files show their real shell icon. */
+static HIMAGELIST SysImageListSmall(void) {
+    SHFILEINFOW sfi = { 0 };
+    return (HIMAGELIST)SHGetFileInfoW(L"C:\\", 0, &sfi, sizeof sfi,
+                                      SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+}
+
+/* System-image-list index for a name of the given kind, resolved purely from
+ * the (fake) attributes + extension — the item need not exist on disk. */
+static int IconIndex(const std::wstring &name, bool isDir) {
+    SHFILEINFOW sfi = { 0 };
+    DWORD attr = isDir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    SHGetFileInfoW(name.c_str(), attr, &sfi, sizeof sfi,
+                   SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+    return sfi.iIcon;
+}
+
+/* Text for the Type column ("File folder", "TXT file", or plain "File"). */
+static std::wstring TypeText(const std::wstring &name, bool isDir) {
+    if (isDir) return L"File folder";
+    size_t dot = name.find_last_of(L'.');
+    if (dot == std::wstring::npos || dot + 1 >= name.size()) return L"File";
+    std::wstring ext = name.substr(dot + 1);
+    CharUpperBuffW(&ext[0], (DWORD)ext.size());
+    return ext + L" file";
+}
+
+/* Rebuild Browser::view: the immediate children (folders then files) of cwd,
+ * sorted per the active column. Directories are synthesized from deeper paths
+ * as well as explicit directory entries, so intermediate folders always show. */
+static void BuildView(Browser *b) {
+    b->view.clear();
+    const std::wstring &cwd = b->cwd;
+    if (!cwd.empty()) {
+        ViewRow up = { L"..", std::wstring(), true, true, 0, -1 };
+        b->view.push_back(up);
+    }
+    std::set<std::wstring> dirSet;
+    std::vector<ViewRow> dirs, files;
+    for (size_t i = 0; i < b->entries.size(); i++) {
+        const ArcEntry &e = b->entries[i];
+        const std::wstring &p = e.path;
+        if (p.size() <= cwd.size() || !StartsWith(p, cwd)) continue;
+        std::wstring rem = p.substr(cwd.size());
+        size_t slash = rem.find(L'/');
+        if (slash != std::wstring::npos) {
+            dirSet.insert(rem.substr(0, slash));
+        } else if (e.isDir) {
+            dirSet.insert(rem);
+        } else {
+            ViewRow r = { rem, p, false, false, e.dataLen, (int)i };
+            files.push_back(std::move(r));
+        }
+    }
+    for (const std::wstring &d : dirSet) {
+        ViewRow r = { d, cwd + d, true, false, 0, -1 };
+        dirs.push_back(std::move(r));
+    }
+    auto cmp = [b](const ViewRow &x, const ViewRow &y) -> bool {
+        if (b->sortCol == 1 && !x.isDir && !y.isDir && x.size != y.size)
+            return b->sortAsc ? x.size < y.size : x.size > y.size;
+        int c = _wcsicmp(x.name.c_str(), y.name.c_str());
+        return b->sortAsc ? c < 0 : c > 0;
+    };
+    std::sort(dirs.begin(), dirs.end(), cmp);
+    std::sort(files.begin(), files.end(), cmp);
+    for (ViewRow &r : dirs)  b->view.push_back(std::move(r));
+    for (ViewRow &r : files) b->view.push_back(std::move(r));
+}
+
+/* Push Browser::view into the ListView. */
+static void FillList(Browser *b) {
+    HWND lv = b->hlist;
+    SendMessageW(lv, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(lv);
+    for (size_t i = 0; i < b->view.size(); i++) {
+        const ViewRow &r = b->view[i];
+        LVITEMW it = { 0 };
+        it.mask     = LVIF_TEXT | LVIF_PARAM | LVIF_IMAGE;
+        it.iItem    = (int)i;
+        it.pszText  = const_cast<wchar_t *>(r.name.c_str());
+        it.lParam   = (LPARAM)i;
+        it.iImage   = r.isUp ? IconIndex(L"folder", true)
+                             : IconIndex(r.name, r.isDir);
+        int idx = ListView_InsertItem(lv, &it);
+        if (idx < 0) continue;
+        if (!r.isDir) {
+            std::wstring sz = PrettySize((long long)r.size);
+            ListView_SetItemText(lv, idx, 1, const_cast<wchar_t *>(sz.c_str()));
+        }
+        if (!r.isUp) {
+            std::wstring tp = TypeText(r.name, r.isDir);
+            ListView_SetItemText(lv, idx, 2, const_cast<wchar_t *>(tp.c_str()));
+        }
+    }
+    SendMessageW(lv, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(lv, nullptr, TRUE);
+}
+
+/* Parent of a "a/b/" cwd ("a/"); "" if already at the root. */
+static std::wstring ParentCwd(const std::wstring &cwd) {
+    if (cwd.empty()) return cwd;
+    std::wstring t = cwd.substr(0, cwd.size() - 1);   /* drop trailing '/' */
+    size_t s = t.find_last_of(L'/');
+    return s == std::wstring::npos ? std::wstring() : t.substr(0, s + 1);
+}
+
+/* Move to a folder and refresh the list, path bar and Up button. */
+static void NavigateTo(Browser *b, const std::wstring &cwd) {
+    b->cwd = cwd;
+    BuildView(b);
+    FillList(b);
+    std::wstring disp = L"\\" + b->cwd;
+    for (wchar_t &c : disp) if (c == L'/') c = L'\\';
+    SetWindowTextW(GetDlgItem(b->hwnd, IDC_PATH_STATIC), disp.c_str());
+    EnableWindow(GetDlgItem(b->hwnd, IDC_UP_BTN), !b->cwd.empty());
+}
+
+/* Double-click / Enter on a row: descend into folders, ascend on "..". */
+static void ActivateRow(Browser *b, int item) {
+    LVITEMW it = { 0 };
+    it.mask = LVIF_PARAM; it.iItem = item;
+    if (!ListView_GetItem(b->hlist, &it)) return;
+    size_t vi = (size_t)it.lParam;
+    if (vi >= b->view.size()) return;
+    const ViewRow &r = b->view[vi];
+    if (r.isUp)       NavigateTo(b, ParentCwd(b->cwd));
+    else if (r.isDir) NavigateTo(b, r.fullPath + L"/");
+}
+
+/* Pick a destination folder (IFileOpenDialog, pick-folders mode). */
+static bool PickFolder(HWND owner, const std::wstring &initial,
+                       std::wstring *out) {
+    IFileOpenDialog *dlg = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))))
+        return false;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM |
+                    FOS_PATHMUSTEXIST);
+    if (!initial.empty()) {
+        IShellItem *si = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(initial.c_str(), nullptr,
+                                                  IID_PPV_ARGS(&si)))) {
+            dlg->SetFolder(si);
+            si->Release();
+        }
+    }
+    bool ok = false;
+    if (SUCCEEDED(dlg->Show(owner))) {
+        IShellItem *item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item))) {
+            PWSTR p = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) {
+                *out = p; CoTaskMemFree(p); ok = true;
+            }
+            item->Release();
+        }
+    }
+    dlg->Release();
+    return ok;
+}
+
+/* Write one entry out of the blob into destRoot, recreating its archive path
+ * (and any parent directories). Path safety was already enforced at listing. */
+static bool ExtractOneEntry(const std::string &blob, const ArcEntry &e,
+                            const std::wstring &destRoot) {
+    std::wstring rel = e.path;
+    for (wchar_t &c : rel) if (c == L'/') c = L'\\';
+    std::wstring full = destRoot + L"\\" + rel;
+    if (e.isDir) return MakeDirTree(full);
+    size_t s = full.find_last_of(L'\\');
+    if (s != std::wstring::npos && !MakeDirTree(full.substr(0, s))) return false;
+    return WriteWholeFile(full, blob.data() + e.dataOff, (size_t)e.dataLen) == 0;
+}
+
+/* Extract either the current selection (all == false) or the whole archive to a
+ * folder the user picks. Selecting a folder pulls everything beneath it; output
+ * always preserves the full archive-relative path (WinRAR's default). */
+static void ExtractSelection(Browser *b, bool all) {
+    std::vector<char> pick(b->entries.size(), 0);
+    std::vector<std::wstring> emptyDirs;   /* selected dirs with no entries  */
+    bool any = false;
+    if (all) {
+        for (size_t i = 0; i < b->entries.size(); i++) { pick[i] = 1; any = true; }
+    } else {
+        int i = -1;
+        while ((i = ListView_GetNextItem(b->hlist, i, LVNI_SELECTED)) != -1) {
+            LVITEMW it = { 0 };
+            it.mask = LVIF_PARAM; it.iItem = i;
+            if (!ListView_GetItem(b->hlist, &it)) continue;
+            size_t vi = (size_t)it.lParam;
+            if (vi >= b->view.size()) continue;
+            const ViewRow &r = b->view[vi];
+            if (r.isUp) continue;
+            if (r.isDir) {
+                std::wstring pfx = r.fullPath + L"/";
+                bool hit = false;
+                for (size_t k = 0; k < b->entries.size(); k++) {
+                    const std::wstring &p = b->entries[k].path;
+                    if (p == r.fullPath || StartsWith(p, pfx)) { pick[k] = 1; hit = true; }
+                }
+                if (!hit) emptyDirs.push_back(r.fullPath);
+                any = true;
+            } else if (r.entryIndex >= 0) {
+                pick[(size_t)r.entryIndex] = 1; any = true;
+            }
+        }
+    }
+    if (!any) {
+        MessageBoxW(b->hwnd, L"Select one or more files or folders to extract.",
+                    APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+
+    std::wstring dest;
+    if (!PickFolder(b->hwnd, DirWithSlash(b->archivePath), &dest)) return;
+
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    uint64_t nfiles = 0, nbytes = 0;
+    bool okAll = true;
+    for (const std::wstring &d : emptyDirs) {
+        std::wstring rel = d;
+        for (wchar_t &c : rel) if (c == L'/') c = L'\\';
+        if (!MakeDirTree(dest + L"\\" + rel)) okAll = false;
+    }
+    for (size_t k = 0; k < b->entries.size(); k++) {
+        if (!pick[k]) continue;
+        const ArcEntry &e = b->entries[k];
+        if (ExtractOneEntry(b->blob, e, dest)) {
+            if (!e.isDir) { nfiles++; nbytes += e.dataLen; }
+        } else {
+            okAll = false;
+        }
+    }
+    SetCursor(old);
+
+    wchar_t msg[600];
+    if (okAll)
+        swprintf(msg, 600, L"Extracted %llu file%s (%s) to:\n%s",
+                 (unsigned long long)nfiles, nfiles == 1 ? L"" : L"s",
+                 PrettySize((long long)nbytes).c_str(), dest.c_str());
+    else
+        swprintf(msg, 600, L"Finished with errors — %llu file%s written to:\n%s",
+                 (unsigned long long)nfiles, nfiles == 1 ? L"" : L"s",
+                 dest.c_str());
+    MessageBoxW(b->hwnd, msg, APP_NAME,
+                okAll ? MB_ICONINFORMATION : MB_ICONWARNING);
+}
+
+static LRESULT CALLBACK BrowserProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    Browser *b = (Browser *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_CREATE: {
+        CREATESTRUCTW *cs = (CREATESTRUCTW *)lp;
+        b = (Browser *)cs->lpCreateParams;
+        b->hwnd = hwnd;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)b);
+        HINSTANCE hi = GetModuleHandleW(nullptr);
+        DWORD bs = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+        HWND up  = CreateWindowExW(0, L"BUTTON", L"Up", bs,
+                                   0, 0, 0, 0, hwnd, (HMENU)IDC_UP_BTN, hi, nullptr);
+        HWND es  = CreateWindowExW(0, L"BUTTON", L"Extract Selected…", bs,
+                                   0, 0, 0, 0, hwnd, (HMENU)IDC_EXTRACT_SEL, hi, nullptr);
+        HWND ea  = CreateWindowExW(0, L"BUTTON", L"Extract All…", bs,
+                                   0, 0, 0, 0, hwnd, (HMENU)IDC_EXTRACT_ALL, hi, nullptr);
+        HWND pth = CreateWindowExW(0, L"STATIC", L"\\",
+                                   WS_CHILD | WS_VISIBLE | SS_PATHELLIPSIS | SS_CENTERIMAGE,
+                                   0, 0, 0, 0, hwnd, (HMENU)IDC_PATH_STATIC, hi, nullptr);
+        HWND lv  = CreateWindowExW(0, WC_LISTVIEWW, L"",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                   LVS_REPORT | LVS_SHOWSELALWAYS,
+                                   0, 0, 0, 0, hwnd, (HMENU)IDC_LV, hi, nullptr);
+        b->hlist = lv;
+        for (HWND h : { up, es, ea, pth, lv })
+            SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
+        ListView_SetExtendedListViewStyle(lv,
+            LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP);
+        HIMAGELIST il = SysImageListSmall();
+        if (il) ListView_SetImageList(lv, il, LVSIL_SMALL);
+        LVCOLUMNW c = { 0 };
+        c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+        c.pszText = (LPWSTR)L"Name"; c.cx = S(260); c.iSubItem = 0; ListView_InsertColumn(lv, 0, &c);
+        c.pszText = (LPWSTR)L"Size"; c.cx = S(90);  c.iSubItem = 1; ListView_InsertColumn(lv, 1, &c);
+        c.pszText = (LPWSTR)L"Type"; c.cx = S(120); c.iSubItem = 2; ListView_InsertColumn(lv, 2, &c);
+        NavigateTo(b, L"");
+        return 0;
+    }
+
+    case WM_SIZE: {
+        if (!b || !b->hlist) return 0;
+        RECT rc; GetClientRect(hwnd, &rc);
+        int pad = S(8), bh = S(26), by = pad, bx = pad;
+        MoveWindow(GetDlgItem(hwnd, IDC_UP_BTN),       bx, by, S(48),  bh, TRUE); bx += S(48)  + pad;
+        MoveWindow(GetDlgItem(hwnd, IDC_EXTRACT_SEL),  bx, by, S(140), bh, TRUE); bx += S(140) + pad;
+        MoveWindow(GetDlgItem(hwnd, IDC_EXTRACT_ALL),  bx, by, S(100), bh, TRUE); bx += S(100) + pad;
+        int pathW = rc.right - bx - pad; if (pathW < S(40)) pathW = S(40);
+        MoveWindow(GetDlgItem(hwnd, IDC_PATH_STATIC),  bx, by + S(4), pathW, S(18), TRUE);
+        int lvY = by + bh + pad;
+        MoveWindow(b->hlist, pad, lvY, rc.right - 2 * pad, rc.bottom - lvY - pad, TRUE);
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if (!b) break;
+        switch (LOWORD(wp)) {
+        case IDC_UP_BTN:      NavigateTo(b, ParentCwd(b->cwd)); return 0;
+        case IDC_EXTRACT_SEL: ExtractSelection(b, false);       return 0;
+        case IDC_EXTRACT_ALL: ExtractSelection(b, true);        return 0;
+        }
+        break;
+
+    case WM_NOTIFY: {
+        NMHDR *nh = (NMHDR *)lp;
+        if (!b || nh->idFrom != IDC_LV) break;
+        if (nh->code == NM_DBLCLK) {
+            NMITEMACTIVATE *ia = (NMITEMACTIVATE *)lp;
+            if (ia->iItem >= 0) ActivateRow(b, ia->iItem);
+            return 0;
+        }
+        if (nh->code == LVN_KEYDOWN) {
+            NMLVKEYDOWN *kd = (NMLVKEYDOWN *)lp;
+            if (kd->wVKey == VK_RETURN) {
+                int i = ListView_GetNextItem(b->hlist, -1, LVNI_FOCUSED);
+                if (i >= 0) ActivateRow(b, i);
+                return 0;
+            }
+            if (kd->wVKey == VK_BACK) { NavigateTo(b, ParentCwd(b->cwd)); return 0; }
+        }
+        if (nh->code == LVN_COLUMNCLICK) {
+            NMLISTVIEW *nl = (NMLISTVIEW *)lp;
+            if (nl->iSubItem == b->sortCol) b->sortAsc = !b->sortAsc;
+            else { b->sortCol = nl->iSubItem; b->sortAsc = true; }
+            BuildView(b); FillList(b);
+            return 0;
+        }
+        break;
+    }
+
+    case WM_DESTROY:
+        if (b) { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); delete b; }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void OpenBrowser(const std::wstring &archivePath, std::string blob,
+                        int threads) {
+    Browser *b   = new Browser();
+    b->archivePath = archivePath;
+    b->blob        = std::move(blob);
+    b->threads     = threads;
+    b->cwd         = L"";
+    b->sortCol     = 0;
+    b->sortAsc     = true;
+    b->hwnd        = nullptr;
+    b->hlist       = nullptr;
+
+    const unsigned char *bytes = (const unsigned char *)b->blob.data();
+    size_t n = b->blob.size();
+    if (IsArchive(bytes, n)) {
+        if (ListArchiveEntries(bytes, n, &b->entries) != SQUISH_OK) {
+            MessageBoxW(g_hwnd,
+                L"The archive directory is corrupt and could not be listed.",
+                APP_NAME, MB_ICONERROR);
+            delete b;
+            return;
+        }
+    } else {
+        /* A single-file archive: show one entry named after the stored (SFX)
+         * name, or the name a plain .sq would extract to. */
+        std::wstring nm;
+        SfxInfo si;
+        if (ProbeSfx(archivePath, &si)) {
+            std::wstring stored;
+            ReadSfxName(archivePath, si, &stored);
+            nm = SafeStoredName(stored);
+        } else {
+            nm = Basename(OutputPath(archivePath, false));
+        }
+        if (nm.empty()) nm = L"file.out";
+        ArcEntry e = { nm, false, 0, (uint64_t)n };
+        b->entries.push_back(std::move(e));
+    }
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof wc };
+        wc.lpfnWndProc   = BrowserProc;
+        wc.hInstance     = GetModuleHandleW(nullptr);
+        wc.hIcon         = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(IDI_APP));
+        wc.hIconSm       = wc.hIcon;
+        wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = BROWSER_CLASS;
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    std::wstring title = Basename(archivePath) + L" — WinSquish";
+    RECT r = { 0, 0, S(560), S(420) };
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    HWND hwnd = CreateWindowExW(0, BROWSER_CLASS, title.c_str(),
+        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+        r.right - r.left, r.bottom - r.top,
+        nullptr, nullptr, GetModuleHandleW(nullptr), b);
+    if (!hwnd) { delete b; return; }   /* WM_CREATE never ran => b not adopted */
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+}
+
 static void CreateControls(HWND hwnd) {
     struct Ctl {
         const wchar_t *cls, *text; DWORD style; int x, y, w, h, id;
@@ -1194,6 +1801,8 @@ static void CreateControls(HWND hwnd) {
                                   12, 118, 110, 30, IDC_COMPRESS_BTN },
         { L"BUTTON",   L"Extract", ES | WS_TABSTOP,
                                   130, 118, 110, 30, IDC_EXTRACT_BTN },
+        { L"BUTTON",   L"View Files…", ES | WS_TABSTOP,
+                                  248, 118, 110, 30, IDC_VIEW_BTN },
         { PROGRESS_CLASSW, L"", ES, 12, 158, 464, 18, IDC_PROGRESS },
         { L"STATIC",   L"Ready.", ES | SS_PATHELLIPSIS,
                                   12, 182, 464, 20, IDC_STATUS },
@@ -1267,6 +1876,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_OPENFOLDER:   BrowseFolder();                     return 0;
         case IDC_COMPRESS_BTN: StartJob(true);                     return 0;
         case IDC_EXTRACT_BTN:  StartJob(false);                    return 0;
+        case IDC_VIEW_BTN:     StartView();                        return 0;
         case IDC_SFX_CHECK:
             if (HIWORD(wp) == BN_CLICKED) UpdateFileInfo();
             return 0;
@@ -1363,6 +1973,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
         if (a == L"--compress")            autoMode = 1;
         else if (a == L"--decompress")     autoMode = 2;
         else if (a == L"--compress-sfx")   autoMode = 3;
+        else if (a == L"--view")           autoMode = 4;
         else if (a == L"--quiet")          ; /* handled in the pre-scan above */
         else if (a == L"--allusers")       ; /* handled in the pre-scan above */
         else if (file.empty())             file = a;
@@ -1378,7 +1989,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
-    INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_PROGRESS_CLASS };
+    INITCOMMONCONTROLSEX icc = { sizeof icc,
+        ICC_PROGRESS_CLASS | ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
 
     g_dpi = GetDpiForSystem();
@@ -1414,6 +2026,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
             PostMessageW(hwnd, WM_COMMAND, IDC_COMPRESS_BTN, 0);
         if (autoMode == 2)
             PostMessageW(hwnd, WM_COMMAND, IDC_EXTRACT_BTN, 0);
+        if (autoMode == 4)
+            PostMessageW(hwnd, WM_COMMAND, IDC_VIEW_BTN, 0);
     }
 
     MSG msg;

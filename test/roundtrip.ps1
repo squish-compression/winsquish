@@ -31,6 +31,37 @@ Write-Host "Using: $Exe"
 
 # --- helpers ---------------------------------------------------------------
 
+# Win32 shims used to inspect the archive-browser window ("View Files"). The
+# browser is a plain Win32 window with a SysListView32 child; we find it by
+# class and read its row count with LVM_GETITEMCOUNT — no clicking required.
+Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public class WsWin {
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, StringBuilder s, int m);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+  public delegate bool EnumProc(IntPtr h, IntPtr p);
+  public static IntPtr browser = IntPtr.Zero;
+  public static IntPtr list = IntPtr.Zero;
+  static string Cls(IntPtr h){ var s = new StringBuilder(256); GetClassName(h, s, 256); return s.ToString(); }
+  static bool FindBrowser(IntPtr h, IntPtr p){ if (Cls(h) == "WinSquishBrowserWindow") browser = h; return true; }
+  static bool FindList(IntPtr h, IntPtr p){ if (Cls(h).StartsWith("SysListView32")) list = h; return true; }
+  // Row count of the browser's list, or -1 if the browser window is absent.
+  public static int ListCount() {
+    browser = IntPtr.Zero;
+    EnumWindows(FindBrowser, IntPtr.Zero);
+    if (browser == IntPtr.Zero) return -1;
+    list = IntPtr.Zero;
+    EnumChildWindows(browser, FindList, IntPtr.Zero);
+    if (list == IntPtr.Zero) return -1;
+    return (int)SendMessage(list, 0x1004 /* LVM_GETITEMCOUNT */, IntPtr.Zero, IntPtr.Zero);
+  }
+}
+'@
+
 function Start-Ws {
     param([string[]] $WsArgs)
     return Start-Process -FilePath $Exe -ArgumentList $WsArgs -PassThru
@@ -194,6 +225,24 @@ try {
     Stop-Ws $p
     if (-not $ok) { throw "Test 3 FAILED: SFX extraction under '$sfxRoot' did not complete" }
     Assert-TreesEqual -Expected $srcHashes -Actual (Get-TreeHashes -Root $sfxRoot) -Label "Test 3 folder SFX round-trip"
+
+    # === Test 4: archive browser lists contents ("View Files") ============
+    # Open src.sq (from Test 1) in the browser and confirm its SysListView32
+    # shows the four root entries: sub\, emptydir\, readme.txt, big.txt.
+    Write-Host "`nTest 4: archive browser ('View Files')"
+    $p = Start-Ws @('--view', $sq)
+    $count = -1
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 500
+        $count = [WsWin]::ListCount()
+        if ($count -ge 0) { break }
+    }
+    Stop-Ws $p
+    if ($count -lt 0) { throw "Test 4 FAILED: browser window / list never appeared" }
+    if ($count -ne 4) {
+        throw "Test 4 FAILED: expected 4 root entries in the browser, got $count"
+    }
+    Write-Host "  [PASS] Test 4 browser lists 4 root entries"
 
     Write-Host "`nAll round-trip tests passed."
     exit 0

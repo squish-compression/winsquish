@@ -19,6 +19,13 @@ context-mixing compressor, with Explorer right-click integration.
   directions. Extracting such a `.sq` recreates the directory tree (empty
   directories and all); extracting a single-file `.sq` writes the file, exactly
   as before — WinSquish detects which it is automatically.
+- **Browse an archive (WinRAR-style)**: click **View Files…** (or run
+  `winsquish.exe --view <archive>`) to open a `.sq` or self-extracting `.exe`
+  in a browsable window. Navigate its folders (double-click to descend, **Up**
+  to ascend), sort by name or size, and **Extract Selected…** files or folders
+  — or **Extract All…** — to a folder you choose, with the archive's directory
+  structure preserved. The archive is decompressed once into memory, so
+  extracting a selection afterwards is instant.
 - **Self-extracting archives (SFX)**: tick **Create self-extracting archive**
   and Compress produces a Windows `.exe` instead of a `.sq` — WinSquish itself
   is the stub, so double-clicking that `.exe` extracts the payload beside it,
@@ -30,6 +37,7 @@ context-mixing compressor, with Explorer right-click integration.
   - right-click any file **or folder** → **Compress to .sq (WinSquish)**
   - right-click any file **or folder** → **Compress to self-extracting .exe
     (WinSquish)**
+  - right-click a `.sq` file → **View files with WinSquish** (opens the browser)
   - right-click a `.sq` file → **Extract with WinSquish**
   - double-clicking a `.sq` file opens it in the GUI
 - **CPU cores**: pick how many workers to use (default **4**, capped at the
@@ -95,6 +103,7 @@ winsquish.exe --compress <path>     open GUI and start compressing to .sq
                                     (<path> may be a file or a folder)
 winsquish.exe --compress-sfx <path> open GUI and build a self-extracting .exe
 winsquish.exe --decompress <file>   open GUI and extract a .sq or an SFX
+winsquish.exe --view <file>         open the archive browser on a .sq or SFX
 winsquish.exe --register            install the context-menu entries (HKCU)
 winsquish.exe --unregister          remove them
 winsquish.exe --register --allusers register system-wide in HKLM (needs admin;
