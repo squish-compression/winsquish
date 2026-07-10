@@ -45,6 +45,8 @@
  *   winsquish.exe --decompress <file>    open GUI and extract (.sq or SFX)
  *   winsquish.exe --register             install context-menu entries (HKCU)
  *   winsquish.exe --unregister           remove them
+ *   winsquish.exe --register --quiet     as above, but no confirmation dialog
+ *                                        (used by the installer/uninstaller)
  *
  * Registration is per-user (HKCU\Software\Classes): no admin rights needed.
  * ==========================================================================*/
@@ -947,25 +949,31 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     std::wstring file;
     int autoMode = 0;   /* 0=none 1=compress 2=decompress 3=compress-sfx */
+    bool quiet = false; /* suppress register/unregister confirmation dialogs */
+    for (int i = 1; i < argc; i++)
+        if (std::wstring(argv[i]) == L"--quiet") quiet = true;
     for (int i = 1; i < argc; i++) {
         std::wstring a = argv[i];
         if (a == L"--register") {
             bool ok = RegisterShell();
-            MessageBoxW(nullptr, ok
-                ? L"WinSquish context-menu entries installed."
-                : L"Registration failed.", APP_NAME,
-                ok ? MB_ICONINFORMATION : MB_ICONERROR);
+            if (!quiet)
+                MessageBoxW(nullptr, ok
+                    ? L"WinSquish context-menu entries installed."
+                    : L"Registration failed.", APP_NAME,
+                    ok ? MB_ICONINFORMATION : MB_ICONERROR);
             return ok ? 0 : 1;
         }
         if (a == L"--unregister") {
             UnregisterShell();
-            MessageBoxW(nullptr, L"WinSquish context-menu entries removed.",
-                        APP_NAME, MB_ICONINFORMATION);
+            if (!quiet)
+                MessageBoxW(nullptr, L"WinSquish context-menu entries removed.",
+                            APP_NAME, MB_ICONINFORMATION);
             return 0;
         }
         if (a == L"--compress")            autoMode = 1;
         else if (a == L"--decompress")     autoMode = 2;
         else if (a == L"--compress-sfx")   autoMode = 3;
+        else if (a == L"--quiet")          ; /* handled in the pre-scan above */
         else if (file.empty())             file = a;
     }
     LocalFree(argv);

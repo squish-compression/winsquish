@@ -47,6 +47,23 @@ This locates Visual Studio via `vswhere`, compiles `src\winsquish.cpp`
 together with the vendored `squish\squish.c`, and produces
 `build\winsquish.exe`. No other dependencies.
 
+## Installer
+
+```bat
+installer\build-installer.bat
+```
+
+Produces `build\winsquish-setup.exe`, a per-user installer (requires
+[Inno Setup](https://jrsoftware.org/isdl.php) 6.3+; it builds
+`winsquish.exe` first if needed). The installer needs **no administrator
+rights** — it installs into `%LOCALAPPDATA%\Programs\WinSquish`, registers
+the `.sq` file type and Explorer context-menu entries under `HKCU`, adds a
+Start Menu shortcut, and creates an Add/Remove Programs entry. Registration
+is delegated to `winsquish.exe --register`, so the installer and the GUI's
+**Tools ▸ Register** command write exactly the same keys. Uninstalling runs
+`--unregister` (which only drops the `.sq` mapping if it still points at
+WinSquish) before removing the files.
+
 ## Command line
 
 ```
@@ -56,6 +73,9 @@ winsquish.exe --compress-sfx <file> open GUI and build a self-extracting .exe
 winsquish.exe --decompress <file>   open GUI and extract a .sq or an SFX
 winsquish.exe --register            install the context-menu entries (HKCU)
 winsquish.exe --unregister          remove them
+winsquish.exe --register --quiet    register with no confirmation dialog
+                                    (--quiet also applies to --unregister;
+                                     used by the installer/uninstaller)
 ```
 
 A self-extracting `.exe` produced here carries an `"SQSFX01"` trailer that is
@@ -78,6 +98,7 @@ src\winsquish.cpp    the application (pure Win32, no MFC/ATL)
 src\winsquish.rc     icon, version info, manifest
 squish\              vendored libsquish (squish.c / squish.h), unmodified
 build.bat            one-step MSVC build
+installer\           Inno Setup script + one-step installer build
 ```
 
 ## License
