@@ -1302,6 +1302,43 @@ static bool PickFolder(HWND owner, const std::wstring &initial,
     return ok;
 }
 
+/* Ask for a destination path + filename (IFileSaveDialog, "Save As"), used when
+ * extracting a single file so the user can rename it. The dialog itself prompts
+ * before overwriting an existing file (FOS_OVERWRITEPROMPT). */
+static bool PickSaveFile(HWND owner, const std::wstring &suggestedName,
+                         const std::wstring &initial, std::wstring *out) {
+    IFileSaveDialog *dlg = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))))
+        return false;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM |
+                    FOS_NOREADONLYRETURN);
+    if (!suggestedName.empty()) dlg->SetFileName(suggestedName.c_str());
+    if (!initial.empty()) {
+        IShellItem *si = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(initial.c_str(), nullptr,
+                                                  IID_PPV_ARGS(&si)))) {
+            dlg->SetFolder(si);
+            si->Release();
+        }
+    }
+    bool ok = false;
+    if (SUCCEEDED(dlg->Show(owner))) {
+        IShellItem *item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item))) {
+            PWSTR p = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) {
+                *out = p; CoTaskMemFree(p); ok = true;
+            }
+            item->Release();
+        }
+    }
+    dlg->Release();
+    return ok;
+}
+
 /* The on-disk path an entry extracts to under destRoot (its archive path with
  * '/'-separators turned into '\\'). */
 static std::wstring EntryDest(const ArcEntry &e, const std::wstring &destRoot) {
@@ -1371,9 +1408,11 @@ static OwResult AskOverwrite(HWND owner, const std::wstring &path,
     return OW_CANCEL;
 }
 
-/* Extract either the current selection (all == false) or the whole archive to a
- * folder the user picks. Selecting a folder pulls everything beneath it; output
- * always preserves the full archive-relative path (WinRAR's default). */
+/* Extract either the current selection (all == false) or the whole archive.
+ * A single selected file goes through a "Save As" dialog (choose folder AND
+ * filename); anything else (folders or multiple files) goes to a destination
+ * folder, each member landing at dest\<archive path> (WinRAR's default), with
+ * a prompt before overwriting existing files. */
 static void ExtractSelection(Browser *b, bool all) {
     std::vector<char> pick(b->entries.size(), 0);
     std::vector<std::wstring> emptyDirs;   /* selected dirs with no entries  */
@@ -1410,6 +1449,38 @@ static void ExtractSelection(Browser *b, bool all) {
         return;
     }
 
+    /* If the selection is exactly one file (no folders), offer a "Save As"
+     * dialog so the destination folder AND filename can be chosen/renamed. */
+    size_t nSelFiles = 0, sole = 0;
+    for (size_t k = 0; k < b->entries.size(); k++)
+        if (pick[k] && !b->entries[k].isDir) { nSelFiles++; sole = k; }
+    bool oneFile = nSelFiles == 1 && emptyDirs.empty();
+    for (size_t k = 0; oneFile && k < b->entries.size(); k++)
+        if (pick[k] && b->entries[k].isDir) oneFile = false;   /* a dir came too */
+
+    if (oneFile) {
+        const ArcEntry &e = b->entries[sole];
+        std::wstring leaf = e.path;
+        size_t sl = leaf.find_last_of(L'/');
+        if (sl != std::wstring::npos) leaf = leaf.substr(sl + 1);
+        std::wstring dest;
+        if (!PickSaveFile(b->hwnd, leaf, DirWithSlash(b->archivePath), &dest))
+            return;
+        HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        bool ok = ExtractMember(b, e, dest);
+        SetCursor(old);
+        wchar_t msg[700];
+        if (ok)
+            swprintf(msg, 700, L"Extracted \"%s\" (%s) to:\n%s", leaf.c_str(),
+                     PrettySize((long long)e.size).c_str(), dest.c_str());
+        else
+            swprintf(msg, 700, L"Failed to extract \"%s\".", leaf.c_str());
+        MessageBoxW(b->hwnd, msg, APP_NAME,
+                    ok ? MB_ICONINFORMATION : MB_ICONWARNING);
+        return;
+    }
+
+    /* Otherwise pick a destination folder; members land at dest\<archive path>. */
     std::wstring dest;
     if (!PickFolder(b->hwnd, DirWithSlash(b->archivePath), &dest)) return;
 
@@ -1537,18 +1608,15 @@ static LRESULT CALLBACK BrowserProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_NOTIFY: {
         NMHDR *nh = (NMHDR *)lp;
         if (!b || nh->idFrom != IDC_LV) break;
-        if (nh->code == NM_DBLCLK) {
+        if (nh->code == LVN_ITEMACTIVATE) {
+            /* Fires on the user's "open" gesture — double- OR single-click per
+             * their Windows setting, and Enter — so folders open either way. */
             NMITEMACTIVATE *ia = (NMITEMACTIVATE *)lp;
             if (ia->iItem >= 0) ActivateRow(b, ia->iItem);
             return 0;
         }
         if (nh->code == LVN_KEYDOWN) {
             NMLVKEYDOWN *kd = (NMLVKEYDOWN *)lp;
-            if (kd->wVKey == VK_RETURN) {
-                int i = ListView_GetNextItem(b->hlist, -1, LVNI_FOCUSED);
-                if (i >= 0) ActivateRow(b, i);
-                return 0;
-            }
             if (kd->wVKey == VK_BACK) { NavigateTo(b, ParentCwd(b->cwd)); return 0; }
         }
         if (nh->code == LVN_COLUMNCLICK) {

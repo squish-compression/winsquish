@@ -24,13 +24,15 @@ context-mixing compressor, with Explorer right-click integration.
 - **Browse an archive (WinRAR-style)**: click **View Files…** (or run
   `winsquish.exe --view <archive>`) to open a `.sq` or self-extracting `.exe`
   in a browsable window. A seekable archive opens **instantly** — only its
-  header and index are read. Navigate its folders (double-click to descend,
-  **Up** to ascend), sort by name or size, and **Extract Selected…** files or
-  folders — or **Extract All…** — to a folder you choose, with the archive's
-  directory structure preserved. Each file is inflated on demand by seeking
-  straight to its own stream, so extracting a few files out of a huge archive
-  never decompresses the whole thing. When a target already exists you're asked
-  whether to overwrite (with an "apply to all" option).
+  header and index are read. Open folders to descend (single- or double-click,
+  per your Windows setting, or Enter), **Up** / Backspace to ascend, and sort
+  by name or size. **Extract Selected…** files or folders — or **Extract
+  All…** — where a single selected file opens a **Save As** dialog (choose the
+  folder *and* the filename) and any other selection asks for a destination
+  folder, with the archive's directory structure preserved. Each file is
+  inflated on demand by seeking straight to its own stream, so pulling a few
+  files out of a huge archive never decompresses the whole thing. Overwriting
+  an existing file is confirmed first (with an "apply to all" option).
 - **Self-extracting archives (SFX)**: tick **Create self-extracting archive**
   and Compress produces a Windows `.exe` instead of a `.sq` — WinSquish itself
   is the stub, so double-clicking that `.exe` extracts the payload beside it,
