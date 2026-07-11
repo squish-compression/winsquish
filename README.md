@@ -12,20 +12,25 @@ context-mixing compressor, with Explorer right-click integration.
 - **GUI**: pick or drag-and-drop a **file or a folder**, then **Compress**
   (to `.sq`) or **Extract**, with a live progress bar. Shows the original size
   stored in a `.sq` stream's header before you extract.
-- **Folders / multi-file archives**: drop a folder (or use **File ▸ Open
-  folder…**) and Compress packs the whole tree into a single `.sq`. The tree is
-  serialized into SQUISH's `SQAR` archive format and compressed as one stream,
-  so a folder `.sq` interoperates byte-for-byte with the `squish` CLI in both
-  directions. Extracting such a `.sq` recreates the directory tree (empty
-  directories and all); extracting a single-file `.sq` writes the file, exactly
-  as before — WinSquish detects which it is automatically.
+- **Folders / seekable archives**: drop a folder (or use **File ▸ Open
+  folder…**) and Compress packs the whole tree into a single `.sq` in SQUISH's
+  seekable **`SQAR02`** archive format — each file is compressed as its own
+  stream behind a compact index, so a reader can list members and pull out one
+  file or subtree by seeking straight to it, without inflating the rest. Folder
+  archives interoperate byte-for-byte with the `squish` CLI (`c`/`l`/`x`/`d`)
+  in both directions. Extracting such a `.sq` recreates the directory tree
+  (empty directories and all); extracting a single-file `.sq` writes the file —
+  WinSquish detects which it is automatically.
 - **Browse an archive (WinRAR-style)**: click **View Files…** (or run
   `winsquish.exe --view <archive>`) to open a `.sq` or self-extracting `.exe`
-  in a browsable window. Navigate its folders (double-click to descend, **Up**
-  to ascend), sort by name or size, and **Extract Selected…** files or folders
-  — or **Extract All…** — to a folder you choose, with the archive's directory
-  structure preserved. The archive is decompressed once into memory, so
-  extracting a selection afterwards is instant.
+  in a browsable window. A seekable archive opens **instantly** — only its
+  header and index are read. Navigate its folders (double-click to descend,
+  **Up** to ascend), sort by name or size, and **Extract Selected…** files or
+  folders — or **Extract All…** — to a folder you choose, with the archive's
+  directory structure preserved. Each file is inflated on demand by seeking
+  straight to its own stream, so extracting a few files out of a huge archive
+  never decompresses the whole thing. When a target already exists you're asked
+  whether to overwrite (with an "apply to all" option).
 - **Self-extracting archives (SFX)**: tick **Create self-extracting archive**
   and Compress produces a Windows `.exe` instead of a `.sq` — WinSquish itself
   is the stub, so double-clicking that `.exe` extracts the payload beside it,

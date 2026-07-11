@@ -125,8 +125,7 @@ struct Job {
     bool         compress;   /* true = compress, false = extract              */
     bool         sfx;        /* compress: build .exe SFX; extract: src is SFX */
     bool         srcIsDir;   /* compress: source is a folder (SQAR archive)   */
-    bool         listing;    /* true = decompress into `blob` for the browser */
-    std::string  blob;       /* listing: the decompressed archive bytes       */
+    bool         tree;       /* extract: output is a directory tree (archive) */
     int          threads;    /* worker count; 1 = single-block (best ratio)   */
     volatile LONG lastPct;
 };
@@ -408,29 +407,15 @@ static int WriteSfx(uint64_t stubLen, const std::wstring &payloadPath,
     return rc;
 }
 
-/* --- directory archive "SQAR" (matches the squish CLI, docs FORMAT.md §12) --
- * A directory is not compressed directly: its whole tree is first serialized
- * into a single "SQAR" byte stream (built below), which is then handed to the
- * ordinary buffer compressor — so libsquish never has to know about files or
- * directories. On extraction we decompress to a buffer and, if it begins with
- * the SQAR magic, unpack the tree; otherwise the buffer is a single file and
- * is written verbatim (byte-for-byte compatible with pre-directory streams).
- *
- * Layout (all integers little-endian). Header:
- *     magic[8]="SQAR01\n\x1a" | version u32 (1) | flags u32 (0) | count u64
- * then `count` entries, each:
- *     type u8 (0=file,1=dir) | mode u32 | path_len u32 | data_len u64 |
- *     path[path_len] (relative, '/'-separated, UTF-8) | data[data_len]
- * Directories carry data_len 0 and are emitted before their contents (so empty
- * ones survive); siblings are stored sorted by name, so the archive depends
- * only on the tree, not on directory-iteration order. The whole layout is
- * identical to the CLI's, so folder archives interoperate in both directions. */
-static const unsigned char SQAR_MAGIC[8] =
-    { 'S','Q','A','R','0','1','\n','\x1a' };
-#define SQAR_VERSION  1u
-#define SQAR_HDR_LEN  24u             /* magic8 + version4 + flags4 + count8 */
-#define SQAR_ENT_LEN  17u             /* type1 + mode4 + plen4 + dlen8       */
-#define SQAR_MAX_PATH 65535u
+/* --- directory archives ("SQAR02", docs FORMAT.md §12) ---------------------
+ * A directory is packed into a seekable SQAR archive entirely by libsquish
+ * (squish_archive_create): each file becomes its own compressed stream behind
+ * a compact index, so a reader can list members and inflate one file or subtree
+ * by seeking straight to it — never touching the rest. WinSquish no longer
+ * serializes the tree itself; it just calls the archive API for creation,
+ * listing (the browser), and extraction. The small helpers below (UTF-8
+ * conversion, whole-file/range I/O, mkdir -p) remain because the SFX container
+ * and the browser's own file writes still need them. */
 
 /* UTF-8 (n bytes) -> wide. */
 static std::wstring FromUtf8(const char *s, int n) {
@@ -521,214 +506,6 @@ static bool MakeDirTree(const std::wstring &path) {
     return IsDirectory(path);
 }
 
-/* A growable byte buffer + running entry count for building an archive.
- * (Named ArcBuf, not Arc — the Win32 GDI Arc() function would hide the tag.) */
-struct ArcBuf { std::string buf; uint64_t count = 0; };
-static void ArcU8 (ArcBuf &a, unsigned char v) { a.buf.push_back((char)v); }
-static void ArcU32(ArcBuf &a, uint32_t v) {
-    unsigned char t[4]; PutU32LE(t, v); a.buf.append((const char *)t, 4);
-}
-static void ArcU64(ArcBuf &a, uint64_t v) {
-    unsigned char t[8]; PutU64LE(t, v); a.buf.append((const char *)t, 8);
-}
-
-/* Names inside `dir` (excluding "." and ".."), each with its UTF-8 form,
- * sorted by the UTF-8 bytes so archives are reproducible and match the CLI. */
-struct DirEnt { std::wstring w; std::string u8; };
-static bool ListDirSorted(const std::wstring &dir, std::vector<DirEnt> *out) {
-    out->clear();
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE)
-        return GetLastError() == ERROR_FILE_NOT_FOUND;     /* empty dir is ok */
-    do {
-        const wchar_t *nm = fd.cFileName;
-        if (!wcscmp(nm, L".") || !wcscmp(nm, L"..")) continue;
-        out->push_back({ nm, ToUtf8(nm) });
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    std::sort(out->begin(), out->end(), [](const DirEnt &a, const DirEnt &b) {
-        size_t n = a.u8.size() < b.u8.size() ? a.u8.size() : b.u8.size();
-        int c = memcmp(a.u8.data(), b.u8.data(), n);   /* unsigned, like strcmp */
-        return c ? c < 0 : a.u8.size() < b.u8.size();
-    });
-    return true;
-}
-
-static bool ArcAddContents(ArcBuf &a, const std::wstring &fsDir,
-                           const std::string &arcPrefix);
-
-/* Append one filesystem item `fs` to the archive under the archive-relative
- * path `arcRel` (its full '/'-separated path from the archive root). */
-static bool ArcAddItem(ArcBuf &a, const std::wstring &fs, const std::string &arcRel) {
-    if (arcRel.empty() || arcRel.size() > SQAR_MAX_PATH) return false;
-    if (IsDirectory(fs)) {
-        ArcU8(a, 1); ArcU32(a, 0755);
-        ArcU32(a, (uint32_t)arcRel.size()); ArcU64(a, 0);
-        a.buf.append(arcRel);
-        a.count++;
-        return ArcAddContents(a, fs, arcRel);
-    }
-    std::string data;
-    if (!ReadWholeFile(fs, &data)) return false;
-    ArcU8(a, 0); ArcU32(a, 0644);
-    ArcU32(a, (uint32_t)arcRel.size()); ArcU64(a, (uint64_t)data.size());
-    a.buf.append(arcRel);
-    a.buf.append(data);
-    a.count++;
-    return true;
-}
-
-/* Append every child of `fsDir` (sorted). arcPrefix is the archive path of
- * fsDir ("" at the top level, so top-level entries are the folder's contents). */
-static bool ArcAddContents(ArcBuf &a, const std::wstring &fsDir,
-                           const std::string &arcPrefix) {
-    std::vector<DirEnt> names;
-    if (!ListDirSorted(fsDir, &names)) return false;
-    for (const DirEnt &e : names) {
-        std::string arc = arcPrefix.empty() ? e.u8 : arcPrefix + "/" + e.u8;
-        if (!ArcAddItem(a, fsDir + L"\\" + e.w, arc)) return false;
-    }
-    return true;
-}
-
-/* Serialize directory `dir` into a fresh SQAR buffer. */
-static bool BuildArchive(const std::wstring &dir, std::string *out,
-                         uint64_t *entries) {
-    ArcBuf a;
-    a.buf.append((const char *)SQAR_MAGIC, 8);
-    ArcU32(a, SQAR_VERSION); ArcU32(a, 0); ArcU64(a, 0);   /* count patched below */
-    if (!ArcAddContents(a, dir, "")) return false;
-    PutU64LE((unsigned char *)&a.buf[16], a.count);
-    if (entries) *entries = a.count;
-    *out = std::move(a.buf);
-    return true;
-}
-
-/* True if `buf` looks like a serialized archive (magic + known version). */
-static bool IsArchive(const void *buf, size_t len) {
-    return len >= SQAR_HDR_LEN && memcmp(buf, SQAR_MAGIC, 8) == 0 &&
-           GetU32LE((const unsigned char *)buf + 8) == SQAR_VERSION;
-}
-
-/* A stored path is safe iff it is relative and every component is non-empty,
- * not "." or "..", and free of '\\', ':' and NUL — so an archive can never
- * write outside the extraction root. Mirrors the CLI's arc_path_safe. */
-static bool ArcPathSafe(const char *p, size_t n) {
-    if (n == 0 || p[0] == '/') return false;
-    for (size_t i = 0; i < n; ) {
-        size_t j = i;
-        while (j < n && p[j] != '/') j++;
-        size_t clen = j - i;
-        if (clen == 0) return false;
-        if (clen == 1 && p[i] == '.') return false;
-        if (clen == 2 && p[i] == '.' && p[i + 1] == '.') return false;
-        for (size_t k = i; k < j; k++) {
-            unsigned char c = (unsigned char)p[k];
-            if (c == '\\' || c == ':' || c == '\0') return false;
-        }
-        i = (j < n) ? j + 1 : j;
-    }
-    return true;
-}
-
-/* Unpack a validated SQAR buffer into directory `outRoot` (created if needed).
- * Every length and path is bounds-checked and traversal-guarded; a malformed
- * archive returns SQUISH_E_FORMAT, an I/O failure SQUISH_E_IO. */
-static int UnpackArchive(const unsigned char *b, size_t len,
-                         const std::wstring &outRoot, uint64_t *nfiles,
-                         uint64_t *nbytes) {
-    if (!IsArchive(b, len)) return SQUISH_E_FORMAT;
-    uint64_t count = GetU64LE(b + 16);
-    size_t off = SQAR_HDR_LEN;
-    uint64_t files = 0, bytes = 0;
-    if (!MakeDirTree(outRoot)) return SQUISH_E_IO;
-
-    for (uint64_t i = 0; i < count; i++) {
-        if (len - off < SQAR_ENT_LEN) return SQUISH_E_FORMAT;
-        unsigned char type = b[off];
-        uint32_t plen = GetU32LE(b + off + 5);
-        uint64_t dlen = GetU64LE(b + off + 9);
-        off += SQAR_ENT_LEN;
-        if (plen == 0 || plen > SQAR_MAX_PATH || plen > len - off)
-            return SQUISH_E_FORMAT;
-        const char *path = (const char *)(b + off);
-        if (!ArcPathSafe(path, plen)) return SQUISH_E_FORMAT;
-        std::wstring rel = FromUtf8(path, (int)plen);
-        for (wchar_t &c : rel) if (c == L'/') c = L'\\';
-        off += plen;
-        std::wstring full = outRoot + L"\\" + rel;
-
-        if (type == 1) {                                   /* directory */
-            if (dlen != 0) return SQUISH_E_FORMAT;
-            if (!MakeDirTree(full)) return SQUISH_E_IO;
-        } else if (type == 0) {                            /* regular file */
-            if (dlen > len - off) return SQUISH_E_FORMAT;
-            size_t s = full.find_last_of(L'\\');
-            if (s != std::wstring::npos && !MakeDirTree(full.substr(0, s)))
-                return SQUISH_E_IO;
-            if (WriteWholeFile(full, b + off, (size_t)dlen) != 0)
-                return SQUISH_E_IO;
-            off += (size_t)dlen;
-            files++; bytes += dlen;
-        } else {
-            return SQUISH_E_FORMAT;
-        }
-    }
-    if (off != len) return SQUISH_E_FORMAT;                /* entries must tile */
-    if (nfiles) *nfiles = files;
-    if (nbytes) *nbytes = bytes;
-    return SQUISH_OK;
-}
-
-/* One entry of an archive as seen by the browser: its archive-relative path
- * ('/'-separated, no trailing slash), whether it is a directory, and — for a
- * file — where its bytes live inside the decompressed buffer. */
-struct ArcEntry {
-    std::wstring path;
-    bool         isDir;
-    uint64_t     dataOff;   /* offset of the file's bytes within the blob     */
-    uint64_t     dataLen;
-};
-
-/* Enumerate the entries of a validated SQAR buffer WITHOUT writing anything to
- * disk — the browser's read-only view of the archive. Same parsing and safety
- * checks as UnpackArchive; `dataOff` points into `b`, so the buffer must stay
- * alive for as long as the returned entries are used. */
-static int ListArchiveEntries(const unsigned char *b, size_t len,
-                              std::vector<ArcEntry> *out) {
-    if (!IsArchive(b, len)) return SQUISH_E_FORMAT;
-    uint64_t count = GetU64LE(b + 16);
-    size_t off = SQAR_HDR_LEN;
-    out->clear();
-    for (uint64_t i = 0; i < count; i++) {
-        if (len - off < SQAR_ENT_LEN) return SQUISH_E_FORMAT;
-        unsigned char type = b[off];
-        uint32_t plen = GetU32LE(b + off + 5);
-        uint64_t dlen = GetU64LE(b + off + 9);
-        off += SQAR_ENT_LEN;
-        if (plen == 0 || plen > SQAR_MAX_PATH || plen > len - off)
-            return SQUISH_E_FORMAT;
-        const char *path = (const char *)(b + off);
-        if (!ArcPathSafe(path, plen)) return SQUISH_E_FORMAT;
-        ArcEntry e;
-        e.path = FromUtf8(path, (int)plen);       /* keep '/' separators */
-        off += plen;
-        if (type == 1) {                                   /* directory */
-            if (dlen != 0) return SQUISH_E_FORMAT;
-            e.isDir = true; e.dataOff = 0; e.dataLen = 0;
-        } else if (type == 0) {                            /* regular file */
-            if (dlen > len - off) return SQUISH_E_FORMAT;
-            e.isDir = false; e.dataOff = off; e.dataLen = dlen;
-            off += (size_t)dlen;
-        } else {
-            return SQUISH_E_FORMAT;
-        }
-        out->push_back(std::move(e));
-    }
-    if (off != len) return SQUISH_E_FORMAT;
-    return SQUISH_OK;
-}
 
 /* --- context-menu registration (Software\Classes) --------------------------
  * Registration is written under one of two roots:
@@ -842,49 +619,82 @@ static void SquishProgress(uint64_t done, uint64_t total, void *user) {
         PostMessageW(job->hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0);
 }
 
-/* Compress job->src to a plain SQUISH stream at `outPath`. A directory is
- * serialized into an SQAR archive first, then compressed as one buffer; a file
- * is streamed straight through the file helpers (no in-memory copy). */
+/* Classify the payload beginning at `off` in `path`: 'a' = SQAR archive,
+ * 's' = plain §1 stream, 0 = neither. Reads only the first bytes. */
+static char ProbePayloadKind(const std::wstring &path, uint64_t off) {
+    HANDLE h = OpenShared(path);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER pos; pos.QuadPart = (long long)off;
+    if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) { CloseHandle(h); return 0; }
+    unsigned char hd[16]; DWORD got = 0;
+    BOOL ok = ReadFile(h, hd, sizeof hd, &got, nullptr);
+    CloseHandle(h);
+    if (!ok || got < 12) return 0;
+    if (squish_archive_probe(hd, (size_t)got)) return 'a';
+    uint64_t sz;
+    if (squish_decompressed_size(hd, (size_t)got, &sz) == SQUISH_OK) return 's';
+    return 0;
+}
+
+/* Open the archive browser (defined near the browser window code below). */
+static void OpenBrowser(const std::wstring &archivePath, int threads);
+
+/* Compress job->src to `outPath`. A directory becomes a seekable SQAR archive
+ * (each file its own stream behind an index); a single file becomes a plain
+ * SQUISH stream. libsquish does all the archive work. */
 static int CompressToStream(Job *job, const std::wstring &outPath) {
-    if (IsDirectory(job->src)) {
-        std::string blob;
-        if (!BuildArchive(job->src, &blob, nullptr)) return SQUISH_E_IO;
-        void *comp = nullptr; size_t clen = 0;
-        int rc = squish_compress_alloc_mt(blob.data(), blob.size(), &comp, &clen,
-                                          job->threads, 0, SquishProgress, job);
-        if (rc != SQUISH_OK) return rc;
-        int wr = WriteWholeFile(outPath, comp, clen);
-        squish_free(comp);
-        return wr == 0 ? SQUISH_OK : SQUISH_E_IO;
-    }
     std::string src = ToUtf8(job->src), out = ToUtf8(outPath);
+    if (IsDirectory(job->src))
+        return squish_archive_create(src.c_str(), out.c_str(),
+                                     job->threads, 0, SquishProgress, job);
     return job->threads > 1
          ? squish_compress_file_mt(src.c_str(), out.c_str(), job->threads, 0,
                                    SquishProgress, job)
          : squish_compress_file2(src.c_str(), out.c_str(), SquishProgress, job);
 }
 
-/* Decompress a whole compressed stream held in memory and write the result to
- * job->dst: a directory tree when the payload is an SQAR archive, otherwise a
- * single file. Used for both plain .sq streams and SFX payloads. */
-static int ExtractStream(Job *job, const unsigned char *comp, size_t clen) {
-    void *raw = nullptr; size_t rn = 0;
-    int rc = squish_decompress_alloc_mt(comp, clen, &raw, &rn, job->threads,
-                                        SquishProgress, job);
-    if (rc != SQUISH_OK) return rc;
-    if (IsArchive(raw, rn)) {
-        uint64_t nf = 0, nb = 0;
-        rc = UnpackArchive((const unsigned char *)raw, rn, job->dst, &nf, &nb);
+/* Extract a whole SQAR archive (every member) into the directory job->dst.
+ * For an SFX the archive image is in memory (`data`/`len`, the payload region);
+ * for a plain .sq we open the file by path so libsquish seeks per member. */
+static int ExtractArchive(Job *job, const void *data, size_t len) {
+    squish_archive *a = nullptr;
+    int rc;
+    if (job->sfx) {
+        rc = squish_archive_open_memory(data, len, &a);
     } else {
-        rc = WriteWholeFile(job->dst, raw, rn) == 0 ? SQUISH_OK : SQUISH_E_IO;
+        std::string src = ToUtf8(job->src);
+        rc = squish_archive_open(src.c_str(), &a);
     }
-    squish_free(raw);
+    if (rc != SQUISH_OK) return rc;
+    if (!MakeDirTree(job->dst)) { squish_archive_close(a); return SQUISH_E_IO; }
+    std::string dst = ToUtf8(job->dst);
+    rc = squish_archive_extract_subtree(a, nullptr, dst.c_str(),
+                                        SquishProgress, job);
+    squish_archive_close(a);
     return rc;
 }
 
+/* Extract a single §1 stream to the file job->dst. For an SFX the compressed
+ * bytes are in memory (`data`/`len`); for a plain .sq we stream from the file. */
+static int ExtractSingle(Job *job, const void *data, size_t len) {
+    if (job->sfx) {
+        void *raw = nullptr; size_t rn = 0;
+        int rc = squish_decompress_alloc_mt(data, len, &raw, &rn,
+                                            job->threads, SquishProgress, job);
+        if (rc != SQUISH_OK) return rc;
+        rc = WriteWholeFile(job->dst, raw, rn) == 0 ? SQUISH_OK : SQUISH_E_IO;
+        squish_free(raw);
+        return rc;
+    }
+    std::string src = ToUtf8(job->src), dst = ToUtf8(job->dst);
+    return squish_decompress_file_mt(src.c_str(), dst.c_str(), job->threads,
+                                     SquishProgress, job);
+}
+
 /* Build job->dst as a self-extracting .exe: compress the source (file or
- * directory) to a scratch SQUISH stream (progress is reported over this, the
- * slow part), then splice [stub][payload][name][trailer] into the output. */
+ * directory) to a scratch payload (a §1 stream for a file, a whole SQAR archive
+ * for a directory — the slow part, over which progress is reported), then
+ * splice [stub][payload][name][trailer] into the output. */
 static int SfxCompress(Job *job) {
     std::wstring tmp = MakeTempPath();
     if (tmp.empty()) return SQUISH_E_IO;
@@ -904,60 +714,27 @@ static int SfxCompress(Job *job) {
     return rc;
 }
 
-/* Extract the payload of an SFX (job->src, any platform's stub) to job->dst:
- * read the payload region into memory, then decompress + unpack it. */
-static int SfxExtract(Job *job) {
-    SfxInfo info;
-    if (!ProbeSfx(job->src, &info)) return SQUISH_E_FORMAT;
+/* Run an extraction job: read the SFX payload region into memory if needed,
+ * then dispatch on job->tree (archive tree vs. single file). */
+static int DoExtract(Job *job) {
     std::string payload;
-    if (!ReadRange(job->src, info.payloadOff, info.payloadLen, &payload))
-        return SQUISH_E_IO;
-    return ExtractStream(job, (const unsigned char *)payload.data(),
-                         payload.size());
-}
-
-/* Decompress the whole of job->src (a .sq stream or any-platform SFX) into
- * `out`, without unpacking it — the raw bytes the browser enumerates. The SFX
- * vs. plain distinction is re-detected here so it does not depend on job flags. */
-static int DecompressArchiveBlob(Job *job, std::string *out) {
-    std::string comp;
-    SfxInfo info;
-    if (ProbeSfx(job->src, &info)) {
-        if (!ReadRange(job->src, info.payloadOff, info.payloadLen, &comp))
+    const void *data = nullptr; size_t len = 0;
+    if (job->sfx) {
+        SfxInfo info;
+        if (!ProbeSfx(job->src, &info)) return SQUISH_E_FORMAT;
+        if (!ReadRange(job->src, info.payloadOff, info.payloadLen, &payload))
             return SQUISH_E_IO;
-    } else if (!ReadWholeFile(job->src, &comp)) {
-        return SQUISH_E_IO;
+        data = payload.data(); len = payload.size();
     }
-    void *raw = nullptr; size_t rn = 0;
-    int rc = squish_decompress_alloc_mt((const unsigned char *)comp.data(),
-                                        comp.size(), &raw, &rn, job->threads,
-                                        SquishProgress, job);
-    if (rc != SQUISH_OK) return rc;
-    out->assign((const char *)raw, rn);
-    squish_free(raw);
-    return SQUISH_OK;
+    return job->tree ? ExtractArchive(job, data, len)
+                     : ExtractSingle(job, data, len);
 }
-
-/* Open the archive browser for `archivePath`, taking ownership of its already
- * decompressed bytes. Defined below, near the browser window code. */
-static void OpenBrowser(const std::wstring &archivePath, std::string blob,
-                        int threads);
 
 static DWORD WINAPI WorkerProc(LPVOID param) {
     Job *job = (Job *)param;
-    int rc;
-    if (job->listing) {
-        rc = DecompressArchiveBlob(job, &job->blob);
-    } else if (job->compress) {
-        rc = job->sfx ? SfxCompress(job) : CompressToStream(job, job->dst);
-    } else if (job->sfx) {
-        rc = SfxExtract(job);
-    } else {
-        std::string comp;
-        rc = ReadWholeFile(job->src, &comp)
-           ? ExtractStream(job, (const unsigned char *)comp.data(), comp.size())
-           : SQUISH_E_IO;
-    }
+    int rc = job->compress
+           ? (job->sfx ? SfxCompress(job) : CompressToStream(job, job->dst))
+           : DoExtract(job);
     PostMessageW(job->hwnd, WM_APP_DONE, (WPARAM)rc, 0);
     return 0;
 }
@@ -1004,9 +781,27 @@ static void UpdateFileInfo(void) {
     if (ProbeSfx(path, &sfx)) {
         std::wstring stored;
         ReadSfxName(path, sfx, &stored);
-        info += L"  —  self-extracting SQUISH archive";
+        bool arc = ProbePayloadKind(path, sfx.payloadOff) == 'a';
+        info += arc ? L"  —  self-extracting SQUISH archive (folder)"
+                    : L"  —  self-extracting SQUISH archive";
         if (!stored.empty())
             info += L", extracts to \"" + SafeStoredName(stored) + L"\"";
+        SetDefaultButton(true);
+    } else if (ProbePayloadKind(path, 0) == 'a') {
+        std::string u8 = ToUtf8(path);
+        squish_archive *a = nullptr;
+        squish_archive_info ai;
+        if (squish_archive_open(u8.c_str(), &a) == SQUISH_OK &&
+            squish_archive_info_get(a, &ai) == SQUISH_OK) {
+            wchar_t t[96];
+            swprintf(t, 96, L"  —  SQUISH archive, %llu items, %s uncompressed",
+                     (unsigned long long)ai.entry_count,
+                     PrettySize((long long)ai.total_size).c_str());
+            info += t;
+        } else {
+            info += L"  —  SQUISH directory archive";
+        }
+        if (a) squish_archive_close(a);
         SetDefaultButton(true);
     } else if (ReadSqHeader(path, &orig)) {
         info += L"  —  SQUISH stream, original size " +
@@ -1075,29 +870,34 @@ static void StartJob(bool compress) {
         return;
     }
 
-    /* Decide direction, whether SFX is involved, and the output path. */
-    bool sfx;
+    /* Decide direction, whether SFX is involved, whether the output is a
+     * directory tree (an archive) or a single file, and the output path. */
+    bool sfx = false, tree = false;
     std::wstring dst;
     if (compress) {
         sfx = IsDlgButtonChecked(g_hwnd, IDC_SFX_CHECK) == BST_CHECKED;
+        tree = srcIsDir;
         dst = sfx ? SfxOutputPath(src) : src + SQ_EXT;
     } else {
         SfxInfo si;
-        uint64_t orig;
         if (ProbeSfx(src, &si)) {
             sfx = true;
+            tree = ProbePayloadKind(src, si.payloadOff) == 'a';
             std::wstring stored;
             ReadSfxName(src, si, &stored);
             dst = DirWithSlash(src) + SafeStoredName(stored);
-        } else if (ReadSqHeader(src, &orig)) {
-            sfx = false;
-            dst = OutputPath(src, false);
         } else {
-            MessageBoxW(g_hwnd,
-                L"This file is not a SQUISH stream or self-extracting archive "
-                L"(bad or missing header).",
-                APP_NAME, MB_ICONERROR);
-            return;
+            char kind = ProbePayloadKind(src, 0);
+            if (kind == 0) {
+                MessageBoxW(g_hwnd,
+                    L"This file is not a SQUISH stream, archive, or "
+                    L"self-extracting archive (bad or missing header).",
+                    APP_NAME, MB_ICONERROR);
+                return;
+            }
+            sfx = false;
+            tree = (kind == 'a');
+            dst = OutputPath(src, false);
         }
     }
 
@@ -1114,8 +914,8 @@ static void StartJob(bool compress) {
             return;
     }
 
-    g_job = new Job{ g_hwnd, src, dst, compress, sfx, srcIsDir,
-                     false, std::string(), SelectedThreads(), -1 };
+    g_job = new Job{ g_hwnd, src, dst, compress, sfx, srcIsDir, tree,
+                     SelectedThreads(), -1 };
     g_t0 = GetTickCount64();
     SetBusy(true);
     SetStatus(compress ? (sfx ? L"Building self-extracting archive…"
@@ -1131,9 +931,10 @@ static void StartJob(bool compress) {
     CloseHandle(th);
 }
 
-/* "View Files": decompress the selected archive into memory (on the worker
- * thread, with progress) and, when done, open the browser window. The archive
- * must be a .sq stream or a self-extracting .exe — a raw folder/file is not. */
+/* "View Files": open the selected archive in the browser window. A seekable
+ * SQAR archive opens instantly (only its header + index are read); a plain
+ * single-file stream shows as one member. The heavy lifting — decompressing an
+ * individual member — happens later, only when the user extracts it. */
 static void StartView(void) {
     if (g_busy) return;
     wchar_t buf[MAX_PATH];
@@ -1150,26 +951,7 @@ static void StartView(void) {
             APP_NAME, MB_ICONINFORMATION);
         return;
     }
-    SfxInfo si; uint64_t orig;
-    if (!ProbeSfx(src, &si) && !ReadSqHeader(src, &orig)) {
-        MessageBoxW(g_hwnd,
-            L"This file is not a SQUISH stream or self-extracting archive, so "
-            L"its contents cannot be listed.", APP_NAME, MB_ICONERROR);
-        return;
-    }
-    g_job = new Job{ g_hwnd, src, std::wstring(), false, false, false,
-                     true, std::string(), SelectedThreads(), -1 };
-    g_t0 = GetTickCount64();
-    SetBusy(true);
-    SetStatus(L"Reading archive…");
-    HANDLE th = CreateThread(nullptr, 0, WorkerProc, g_job, 0, nullptr);
-    if (!th) {
-        SetBusy(false);
-        delete g_job; g_job = nullptr;
-        SetStatus(L"Failed to start worker thread.");
-        return;
-    }
-    CloseHandle(th);
+    OpenBrowser(src, SelectedThreads());
 }
 
 static void OnJobDone(int rc) {
@@ -1177,24 +959,6 @@ static void OnJobDone(int rc) {
     double secs = (GetTickCount64() - g_t0) / 1000.0;
     SetBusy(false);
     if (!job) return;
-
-    /* "View Files" job: hand the decompressed bytes to the browser window. */
-    if (job->listing) {
-        if (rc != SQUISH_OK) {
-            wchar_t err[128];
-            MultiByteToWideChar(CP_UTF8, 0, squish_strerror(rc), -1, err, 128);
-            SetStatus(std::wstring(L"Failed to read archive: ") + err);
-            MessageBoxW(g_hwnd,
-                (std::wstring(L"Could not read this archive:\n") + err).c_str(),
-                APP_NAME, MB_ICONERROR);
-        } else {
-            SendDlgItemMessageW(g_hwnd, IDC_PROGRESS, PBM_SETPOS, 100, 0);
-            SetStatus(L"Archive opened for browsing.");
-            OpenBrowser(job->src, std::move(job->blob), job->threads);
-        }
-        delete job;
-        return;
-    }
 
     if (rc != SQUISH_OK) {
         wchar_t err[128];
@@ -1326,13 +1090,22 @@ static int S(int v) { return MulDiv(v, g_dpi, 96); }
 /* ============================================================================
  * Archive browser — a WinRAR-style window listing the contents of an archive
  *
- * Opening an archive decompresses its whole stream once into memory (the slow
- * part, done on the worker thread). This window then presents that buffer as a
- * navigable tree: double-click folders to descend, "Up" to ascend, and extract
- * either the current selection or everything. Extraction just copies bytes out
- * of the already-decompressed blob, so it is instant — no re-decompression.
+ * A seekable SQAR archive opens instantly — only its header and index are read
+ * — and each file is inflated on demand, by seeking straight to its own stream,
+ * when the user extracts it (libsquish's squish_archive_* API). A plain
+ * single-file .sq (or SFX payload) shows as one member and is decompressed
+ * whole on extraction. Navigate folders by double-clicking (Up / Backspace to
+ * ascend), sort by column, and extract the current selection or everything.
  * ==========================================================================*/
 static const wchar_t *BROWSER_CLASS = L"WinSquishBrowserWindow";
+
+/* One archive member, as listed by the browser. */
+struct ArcEntry {
+    std::wstring path;    /* relative, '/'-separated                          */
+    bool         isDir;
+    uint64_t     size;    /* uncompressed size (0 for a directory)            */
+    uint64_t     index;   /* member index for squish_archive_extract          */
+};
 
 /* One row of the current folder view (a child of the browser's cwd). */
 struct ViewRow {
@@ -1345,14 +1118,17 @@ struct ViewRow {
 };
 
 struct Browser {
-    std::wstring          archivePath;   /* source .sq / .exe               */
-    std::string           blob;          /* decompressed archive bytes       */
-    std::vector<ArcEntry> entries;       /* every entry (dataOff into blob)  */
-    std::wstring          cwd;           /* "" (root) or "a/b/" with slash   */
+    std::wstring          archivePath;  /* source .sq / .exe                  */
+    squish_archive       *arc;          /* seekable handle; NULL if `single`  */
+    std::string           payload;      /* SFX: bytes backing `arc`/`single`  */
+    bool                  sfx;          /* source is a self-extracting .exe   */
+    bool                  single;       /* not an archive: one file member    */
+    std::vector<ArcEntry> entries;      /* every member                       */
+    std::wstring          cwd;          /* "" (root) or "a/b/" with slash     */
     int                   threads;
-    int                   sortCol;       /* 0 = name, 1 = size               */
+    int                   sortCol;      /* 0 = name, 1 = size                 */
     bool                  sortAsc;
-    std::vector<ViewRow>  view;          /* rows currently shown             */
+    std::vector<ViewRow>  view;         /* rows currently shown               */
     HWND                  hwnd;
     HWND                  hlist;
 };
@@ -1412,7 +1188,7 @@ static void BuildView(Browser *b) {
         } else if (e.isDir) {
             dirSet.insert(rem);
         } else {
-            ViewRow r = { rem, p, false, false, e.dataLen, (int)i };
+            ViewRow r = { rem, p, false, false, e.size, (int)i };
             files.push_back(std::move(r));
         }
     }
@@ -1526,17 +1302,73 @@ static bool PickFolder(HWND owner, const std::wstring &initial,
     return ok;
 }
 
-/* Write one entry out of the blob into destRoot, recreating its archive path
- * (and any parent directories). Path safety was already enforced at listing. */
-static bool ExtractOneEntry(const std::string &blob, const ArcEntry &e,
-                            const std::wstring &destRoot) {
+/* The on-disk path an entry extracts to under destRoot (its archive path with
+ * '/'-separators turned into '\\'). */
+static std::wstring EntryDest(const ArcEntry &e, const std::wstring &destRoot) {
     std::wstring rel = e.path;
     for (wchar_t &c : rel) if (c == L'/') c = L'\\';
-    std::wstring full = destRoot + L"\\" + rel;
-    if (e.isDir) return MakeDirTree(full);
+    return destRoot + L"\\" + rel;
+}
+
+static bool PathExists(const std::wstring &p) {
+    return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+/* Inflate file member `e` to `full`, creating parent directories. Seeks to and
+ * decodes only that member's stream when the archive is seekable; for a plain
+ * single-file source it decompresses the whole stream (SFX payload held in
+ * memory, or the .sq read from disk). Returns true on success. */
+static bool ExtractMember(Browser *b, const ArcEntry &e,
+                          const std::wstring &full) {
     size_t s = full.find_last_of(L'\\');
     if (s != std::wstring::npos && !MakeDirTree(full.substr(0, s))) return false;
-    return WriteWholeFile(full, blob.data() + e.dataOff, (size_t)e.dataLen) == 0;
+    void *raw = nullptr; size_t rn = 0;
+    int rc;
+    if (b->arc) {
+        rc = squish_archive_extract(b->arc, e.index, &raw, &rn);
+    } else if (b->sfx) {
+        rc = squish_decompress_alloc_mt(b->payload.data(), b->payload.size(),
+                                        &raw, &rn, b->threads, nullptr, nullptr);
+    } else {
+        std::string comp;
+        if (!ReadWholeFile(b->archivePath, &comp)) return false;
+        rc = squish_decompress_alloc_mt(comp.data(), comp.size(),
+                                        &raw, &rn, b->threads, nullptr, nullptr);
+    }
+    if (rc != SQUISH_OK) return false;
+    bool ok = WriteWholeFile(full, raw, rn) == 0;
+    squish_free(raw);
+    return ok;
+}
+
+/* The user's answer to a "target already exists" prompt. */
+enum OwResult { OW_YES, OW_NO, OW_CANCEL };
+
+/* Ask whether to overwrite an existing target. `*applyAll` is set from the
+ * dialog's "do this for all" checkbox so the caller can stop asking. */
+static OwResult AskOverwrite(HWND owner, const std::wstring &path,
+                             bool *applyAll) {
+    std::wstring content = path + L"\n\nOverwrite the existing file?";
+    TASKDIALOGCONFIG tdc = { sizeof tdc };
+    tdc.hwndParent         = owner;
+    tdc.hInstance          = GetModuleHandleW(nullptr);
+    tdc.dwFlags            = TDF_ALLOW_DIALOG_CANCELLATION |
+                             TDF_POSITION_RELATIVE_TO_WINDOW;
+    tdc.dwCommonButtons    = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON |
+                             TDCBF_CANCEL_BUTTON;
+    tdc.pszWindowTitle     = APP_NAME;
+    tdc.pszMainIcon        = TD_WARNING_ICON;
+    tdc.pszMainInstruction = L"A file already exists at the destination.";
+    tdc.pszContent         = content.c_str();
+    tdc.pszVerificationText = L"Do this for all remaining conflicts";
+    int  button = 0;
+    BOOL verify = FALSE;
+    if (FAILED(TaskDialogIndirect(&tdc, &button, nullptr, &verify)))
+        return OW_CANCEL;
+    if (applyAll) *applyAll = (verify == TRUE);
+    if (button == IDYES) return OW_YES;
+    if (button == IDNO)  return OW_NO;
+    return OW_CANCEL;
 }
 
 /* Extract either the current selection (all == false) or the whole archive to a
@@ -1581,36 +1413,63 @@ static void ExtractSelection(Browser *b, bool all) {
     std::wstring dest;
     if (!PickFolder(b->hwnd, DirWithSlash(b->archivePath), &dest)) return;
 
-    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-    uint64_t nfiles = 0, nbytes = 0;
-    bool okAll = true;
+    uint64_t nfiles = 0, nbytes = 0, nskip = 0;
+    bool okAll = true, cancelled = false;
+    enum { ASK, ALL_YES, ALL_NO } overwrite = ASK;   /* existing-file policy */
+
+    /* Selected-but-empty directories just get created (merging into any that
+     * already exist is harmless, so those never prompt). */
     for (const std::wstring &d : emptyDirs) {
         std::wstring rel = d;
         for (wchar_t &c : rel) if (c == L'/') c = L'\\';
         if (!MakeDirTree(dest + L"\\" + rel)) okAll = false;
     }
-    for (size_t k = 0; k < b->entries.size(); k++) {
+
+    HCURSOR wait = LoadCursorW(nullptr, IDC_WAIT);
+    for (size_t k = 0; k < b->entries.size() && !cancelled; k++) {
         if (!pick[k]) continue;
         const ArcEntry &e = b->entries[k];
-        if (ExtractOneEntry(b->blob, e, dest)) {
-            if (!e.isDir) { nfiles++; nbytes += e.dataLen; }
-        } else {
-            okAll = false;
-        }
-    }
-    SetCursor(old);
+        std::wstring full = EntryDest(e, dest);
 
-    wchar_t msg[600];
-    if (okAll)
-        swprintf(msg, 600, L"Extracted %llu file%s (%s) to:\n%s",
-                 (unsigned long long)nfiles, nfiles == 1 ? L"" : L"s",
-                 PrettySize((long long)nbytes).c_str(), dest.c_str());
+        /* Only files are ever overwritten; existing directories merge. */
+        if (!e.isDir && PathExists(full)) {
+            if (overwrite == ALL_NO) { nskip++; continue; }
+            if (overwrite == ASK) {
+                bool applyAll = false;
+                OwResult r = AskOverwrite(b->hwnd, full, &applyAll);
+                if (r == OW_CANCEL) { cancelled = true; break; }
+                if (r == OW_NO)  { if (applyAll) overwrite = ALL_NO; nskip++; continue; }
+                if (applyAll)    overwrite = ALL_YES;   /* r == OW_YES */
+            }
+        }
+        HCURSOR old = SetCursor(wait);
+        bool ok = e.isDir ? MakeDirTree(full) : ExtractMember(b, e, full);
+        SetCursor(old);
+        if (ok) { if (!e.isDir) { nfiles++; nbytes += e.size; } }
+        else    okAll = false;
+    }
+
+    std::wstring tail = L" to:\n" + dest;
+    if (nskip) {
+        wchar_t s[64];
+        swprintf(s, 64, L"\n(%llu existing file%s skipped)",
+                 (unsigned long long)nskip, nskip == 1 ? L"" : L"s");
+        tail += s;
+    }
+    wchar_t msg[700];
+    const wchar_t *plural = nfiles == 1 ? L"" : L"s";
+    if (cancelled)
+        swprintf(msg, 700, L"Extraction cancelled — %llu file%s written%s",
+                 (unsigned long long)nfiles, plural, tail.c_str());
+    else if (okAll)
+        swprintf(msg, 700, L"Extracted %llu file%s (%s)%s",
+                 (unsigned long long)nfiles, plural,
+                 PrettySize((long long)nbytes).c_str(), tail.c_str());
     else
-        swprintf(msg, 600, L"Finished with errors — %llu file%s written to:\n%s",
-                 (unsigned long long)nfiles, nfiles == 1 ? L"" : L"s",
-                 dest.c_str());
+        swprintf(msg, 700, L"Finished with errors — %llu file%s written%s",
+                 (unsigned long long)nfiles, plural, tail.c_str());
     MessageBoxW(b->hwnd, msg, APP_NAME,
-                okAll ? MB_ICONINFORMATION : MB_ICONWARNING);
+                (okAll && !cancelled) ? MB_ICONINFORMATION : MB_ICONWARNING);
 }
 
 static LRESULT CALLBACK BrowserProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1703,17 +1562,39 @@ static LRESULT CALLBACK BrowserProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_DESTROY:
-        if (b) { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); delete b; }
+        if (b) {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            if (b->arc) squish_archive_close(b->arc);
+            delete b;
+        }
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static void OpenBrowser(const std::wstring &archivePath, std::string blob,
-                        int threads) {
-    Browser *b   = new Browser();
+/* Fill b->entries from an open seekable archive handle. */
+static int LoadArchiveEntries(Browser *b) {
+    uint64_t n = squish_archive_count(b->arc);
+    b->entries.reserve((size_t)n);
+    for (uint64_t i = 0; i < n; i++) {
+        squish_archive_entry e;
+        if (squish_archive_stat(b->arc, i, &e) != SQUISH_OK) return SQUISH_E_FORMAT;
+        ArcEntry a;
+        a.path  = FromUtf8(e.path, (int)strlen(e.path));
+        a.isDir = e.is_dir != 0;
+        a.size  = e.size;
+        a.index = i;
+        b->entries.push_back(std::move(a));
+    }
+    return SQUISH_OK;
+}
+
+static void OpenBrowser(const std::wstring &archivePath, int threads) {
+    Browser *b     = new Browser();
     b->archivePath = archivePath;
-    b->blob        = std::move(blob);
+    b->arc         = nullptr;
+    b->sfx         = false;
+    b->single      = false;
     b->threads     = threads;
     b->cwd         = L"";
     b->sortCol     = 0;
@@ -1721,22 +1602,53 @@ static void OpenBrowser(const std::wstring &archivePath, std::string blob,
     b->hwnd        = nullptr;
     b->hlist       = nullptr;
 
-    const unsigned char *bytes = (const unsigned char *)b->blob.data();
-    size_t n = b->blob.size();
-    if (IsArchive(bytes, n)) {
-        if (ListArchiveEntries(bytes, n, &b->entries) != SQUISH_OK) {
+    /* Decide what we're looking at: an SFX payload region, or a plain file;
+     * within that, a seekable archive or a single §1 stream. */
+    SfxInfo si;
+    uint64_t payloadOff = 0;
+    b->sfx = ProbeSfx(archivePath, &si);
+    if (b->sfx) payloadOff = si.payloadOff;
+    char kind = ProbePayloadKind(archivePath, payloadOff);
+    if (kind == 0) {
+        MessageBoxW(g_hwnd,
+            L"This file is not a SQUISH stream, archive, or self-extracting "
+            L"archive, so its contents cannot be listed.",
+            APP_NAME, MB_ICONERROR);
+        delete b;
+        return;
+    }
+
+    /* For an SFX we must hold the payload bytes: open_memory borrows them, and
+     * a single-file payload is decompressed from them on extraction. */
+    if (b->sfx) {
+        if (!ReadRange(archivePath, si.payloadOff, si.payloadLen, &b->payload)) {
+            MessageBoxW(g_hwnd, L"Could not read the archive payload.",
+                        APP_NAME, MB_ICONERROR);
+            delete b;
+            return;
+        }
+    }
+
+    int rc = SQUISH_OK;
+    if (kind == 'a') {
+        rc = b->sfx
+           ? squish_archive_open_memory(b->payload.data(), b->payload.size(), &b->arc)
+           : squish_archive_open(ToUtf8(archivePath).c_str(), &b->arc);
+        if (rc == SQUISH_OK) rc = LoadArchiveEntries(b);
+        if (rc != SQUISH_OK) {
+            if (b->arc) { squish_archive_close(b->arc); b->arc = nullptr; }
             MessageBoxW(g_hwnd,
-                L"The archive directory is corrupt and could not be listed.",
+                L"The archive could not be opened (corrupt index).",
                 APP_NAME, MB_ICONERROR);
             delete b;
             return;
         }
     } else {
-        /* A single-file archive: show one entry named after the stored (SFX)
-         * name, or the name a plain .sq would extract to. */
+        /* A single-file archive: one entry, named after the stored (SFX) name
+         * or the name a plain .sq would extract to. */
+        b->single = true;
         std::wstring nm;
-        SfxInfo si;
-        if (ProbeSfx(archivePath, &si)) {
+        if (b->sfx) {
             std::wstring stored;
             ReadSfxName(archivePath, si, &stored);
             nm = SafeStoredName(stored);
@@ -1744,7 +1656,10 @@ static void OpenBrowser(const std::wstring &archivePath, std::string blob,
             nm = Basename(OutputPath(archivePath, false));
         }
         if (nm.empty()) nm = L"file.out";
-        ArcEntry e = { nm, false, 0, (uint64_t)n };
+        uint64_t orig = 0;
+        if (b->sfx) squish_decompressed_size(b->payload.data(), b->payload.size(), &orig);
+        else        ReadSqHeader(archivePath, &orig);
+        ArcEntry e = { nm, false, orig, 0 };
         b->entries.push_back(std::move(e));
     }
 
@@ -1769,7 +1684,11 @@ static void OpenBrowser(const std::wstring &archivePath, std::string blob,
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         r.right - r.left, r.bottom - r.top,
         nullptr, nullptr, GetModuleHandleW(nullptr), b);
-    if (!hwnd) { delete b; return; }   /* WM_CREATE never ran => b not adopted */
+    if (!hwnd) {                       /* WM_CREATE never ran => b not adopted */
+        if (b->arc) squish_archive_close(b->arc);
+        delete b;
+        return;
+    }
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 }
