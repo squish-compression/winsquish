@@ -68,6 +68,28 @@ installer\build-installer.bat
 REM -> build\winsquish-setup.exe
 ```
 
+### Code signing (optional)
+
+If a code-signing certificate is configured via environment variables, the
+build signs the app binaries (`WinSquish.exe`, `WinSquish.dll`, `squish.dll`)
+**and** the installer plus its embedded uninstaller. With nothing set, the
+build works unchanged and just skips signing. Configure one certificate source:
+
+```powershell
+# a PFX/P12 file …
+$env:SIGN_PFX = 'C:\certs\winsquish.pfx'; $env:SIGN_PFX_PASSWORD = '…'
+# … or a cert already in a Windows store, by thumbprint …
+$env:SIGN_THUMBPRINT = 'A1B2C3…'
+# … or by subject-name substring.
+$env:SIGN_SUBJECT = 'Paige Julianne Sullivan'
+
+installer\build-installer.bat   # everything comes out signed + timestamped
+```
+
+Signing is SHA-256 and RFC-3161 timestamped (`SIGN_TIMESTAMP_URL` overrides the
+default). It needs `signtool.exe` from the Windows SDK on `PATH`, or point
+`SIGNTOOL` at it. See `installer\sign.ps1` for the full contract.
+
 ## Requirements
 
 - Windows 10 / 11, x64.

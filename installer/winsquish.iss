@@ -58,6 +58,14 @@ MinVersion=10.0
 ; Restart Manager closes a running WinSquish so its files aren't locked.
 CloseApplications=yes
 RestartApplications=no
+; Authenticode signing. build-installer.bat passes /DSign and defines the
+; "winsquishsign" SignTool (a signtool.exe wrapper) when a signing certificate
+; is configured; without it the installer builds unsigned. SignedUninstaller
+; makes Inno sign the uninstaller it embeds, too.
+#ifdef Sign
+SignTool=winsquishsign
+SignedUninstaller=yes
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

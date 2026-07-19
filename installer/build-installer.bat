@@ -35,6 +35,27 @@ if not exist "%PUBLISH%\squish.dll" (
     exit /b 1
 )
 
+REM --- Optional Authenticode signing -------------------------------------
+REM Enabled when a certificate source is configured (see installer\sign.ps1):
+REM   SIGN_PFX (+SIGN_PFX_PASSWORD) | SIGN_THUMBPRINT | SIGN_SUBJECT
+REM When enabled we sign our own binaries here, and hand the same signer to
+REM Inno so it signs the installer and its embedded uninstaller too.
+set "DO_SIGN="
+if defined SIGN_PFX        set "DO_SIGN=1"
+if defined SIGN_THUMBPRINT set "DO_SIGN=1"
+if defined SIGN_SUBJECT    set "DO_SIGN=1"
+
+set "SIGNPS1=%SCRIPT_DIR%sign.ps1"
+set "ISCC_SIGN_FLAGS="
+if defined DO_SIGN (
+    echo Signing application binaries ...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%SIGNPS1%" "%PUBLISH%\WinSquish.exe" "%PUBLISH%\WinSquish.dll" "%PUBLISH%\squish.dll"
+    if errorlevel 1 exit /b 1
+    set "ISCC_SIGN_FLAGS=/DSign "/Swinsquishsign=powershell.exe -NoProfile -ExecutionPolicy Bypass -File $q%SIGNPS1%$q $f""
+) else (
+    echo No signing certificate configured ^(set SIGN_PFX, SIGN_THUMBPRINT, or SIGN_SUBJECT^); skipping code signing.
+)
+
 REM Locate ISCC (Inno Setup 7 or 6).
 set "ISCC="
 for %%D in (
@@ -50,7 +71,7 @@ if not defined ISCC (
 )
 
 echo Compiling installer with %ISCC% ...
-"%ISCC%" "%SCRIPT_DIR%winsquish.iss"
+"%ISCC%" %ISCC_SIGN_FLAGS% "%SCRIPT_DIR%winsquish.iss"
 if errorlevel 1 exit /b 1
 
 echo Done. Installer at %REPO%\build\winsquish-setup.exe
