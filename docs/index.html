@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WinSquish — browse and extract SQUISH archives on Windows</title>
+<meta name="description" content="A Windows file manager for SQUISH (.sqsh) archives. Browse an archive like a folder, extract a single file without inflating the rest, and compress folders straight from Explorer.">
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="stylesheet" href="style.css">
+<meta property="og:title" content="WinSquish">
+<meta property="og:description" content="Browse a .sqsh archive like a folder, drill into its tree, and extract files without inflating the rest.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="screenshot.png">
+</head>
+<body>
+
+<header class="topbar">
+  <a class="brand" href="#top">
+    <img src="winsquish.png" alt="" width="24" height="24">
+    <span>WinSquish</span>
+  </a>
+  <nav>
+    <a href="#features">Features</a>
+    <a href="#explorer">Explorer</a>
+    <a href="#cli">Command line</a>
+    <a href="#build">Build</a>
+    <a class="ghost" href="https://github.com/squish-compression/winsquish">GitHub</a>
+  </nav>
+</header>
+
+<main id="top">
+
+<section class="hero">
+  <div class="hero-text">
+    <p class="eyebrow">Windows&nbsp;10 &amp; 11 · free &amp; open source</p>
+    <h1>A file manager for <span class="nowrap">SQUISH archives</span></h1>
+    <p class="lede">
+      Open a <code>.sqsh</code> archive and it behaves like a folder — a tree on
+      the left, details on the right, breadcrumbs up top. Pull out one file
+      without inflating the other ten thousand.
+    </p>
+    <p class="cta">
+      <a class="btn primary" href="https://github.com/squish-compression/winsquish/releases/latest">Download for Windows</a>
+      <a class="btn" href="https://github.com/squish-compression/winsquish">View source</a>
+    </p>
+    <p class="fineprint">
+      Signed installer · self-contained (no .NET runtime needed) · per-user or
+      all-users install
+    </p>
+  </div>
+  <div class="hero-shot">
+    <img src="screenshot.png" alt="WinSquish showing sample.sqsh: a folder tree beside a details list with name, type, size, packed size and percent saved." width="2340" height="1530" loading="eager">
+  </div>
+</section>
+
+<section class="strip">
+  <div class="strip-item"><strong>Seek, don't unpack</strong><span>Each member reads only its own blocks</span></div>
+  <div class="strip-item"><strong>Checksum-verified</strong><span>Every coded block carries a CRC of its original bytes</span></div>
+  <div class="strip-item"><strong>All cores</strong><span>Compression fans out across your CPU</span></div>
+  <div class="strip-item"><strong>Safe by construction</strong><span>Absolute paths and <code>..</code> are refused</span></div>
+</section>
+
+<section id="features">
+  <h2>What it does</h2>
+  <div class="cards">
+
+    <article class="card">
+      <h3>Browse</h3>
+      <p>
+        An Explorer-style layout: folder tree, details list with
+        name · type · size · packed size · % saved, breadcrumb, status bar.
+        Folder rows aggregate the sizes and ratios of everything beneath them.
+      </p>
+    </article>
+
+    <article class="card">
+      <h3>Extract</h3>
+      <p>
+        The whole archive, a selected subtree, or a single file. Multi-select
+        with Ctrl/Shift, <kbd>Ctrl</kbd>+<kbd>A</kbd> for all, or drag files
+        straight out of the window into Explorer.
+      </p>
+    </article>
+
+    <article class="card">
+      <h3>Preview</h3>
+      <p>
+        Double-click a file and it is extracted to a temp folder and opened in
+        its default app. <em>Save As</em> writes a single file wherever you
+        choose.
+      </p>
+    </article>
+
+    <article class="card">
+      <h3>Create</h3>
+      <p>
+        Compress a folder into a new archive using every core, with a dialog for
+        block size and thread count before the run starts.
+      </p>
+    </article>
+
+    <article class="card">
+      <h3>Edit</h3>
+      <p>
+        Drop files or folders onto an open archive to add them at the current
+        location, or select and press <kbd>Delete</kbd> to remove them. Name
+        clashes prompt; on any failure the original archive is left untouched.
+      </p>
+    </article>
+
+    <article class="card">
+      <h3>Drag &amp; drop</h3>
+      <p>
+        Drop an archive on the window to open it. Drag members out to Explorer
+        to extract them. It works the direction you expect, both ways.
+      </p>
+    </article>
+
+  </div>
+</section>
+
+<section id="explorer" class="split">
+  <div>
+    <h2>Lives in the shell</h2>
+    <p>
+      WinSquish registers itself as the handler for <code>.sqsh</code> and
+      <code>.sq</code> and adds right-click menus, so most of the time you never
+      open the app on purpose.
+    </p>
+    <ul class="ticks">
+      <li>On an archive — <strong>Open with WinSquish</strong>,
+        <strong>Extract Here</strong>, <strong>Extract to folder\</strong></li>
+      <li>On any folder — <strong>Compress to SQUISH archive</strong></li>
+      <li>Each verb is a one-shot action with its own progress window</li>
+    </ul>
+    <p class="note">
+      The app writes the registry keys itself, so the installer just calls it —
+      and you can do the same without admin rights:
+    </p>
+<pre><code>WinSquish.exe --register            <span class="c">:: current user</span>
+WinSquish.exe --register --allusers <span class="c">:: machine-wide</span>
+WinSquish.exe --unregister</code></pre>
+    <p class="note">
+      Or click <em>“Make WinSquish the default for .sqsh files”</em> on the
+      welcome screen.
+    </p>
+  </div>
+  <div id="cli">
+    <h2>Or from a prompt</h2>
+    <p>Every GUI action has a command-line twin.</p>
+<pre><code>WinSquish.exe archive.sqsh
+<span class="c">:: open &amp; browse</span>
+
+WinSquish.exe --extract-here a.sqsh
+<span class="c">:: extract into the archive's own folder</span>
+
+WinSquish.exe --extract-to a.sqsh
+<span class="c">:: extract into a subfolder named after it</span>
+
+WinSquish.exe --compress path
+<span class="c">:: compress a file or folder to path.sqsh</span></code></pre>
+    <p class="note">
+      Add <code>--quiet</code> to the register/unregister calls to suppress the
+      confirmation dialog.
+    </p>
+  </div>
+</section>
+
+<section id="install">
+  <h2>Install</h2>
+  <div class="cards two">
+    <article class="card">
+      <h3>Installer</h3>
+      <p>
+        Grab <code>winsquish-setup.exe</code> from the releases page. It installs
+        a self-contained build, offers per-user or all-users scope, wires up the
+        file associations and context menus, and unregisters cleanly when you
+        uninstall.
+      </p>
+      <p class="cta"><a class="btn primary" href="https://github.com/squish-compression/winsquish/releases/latest">Latest release</a></p>
+    </article>
+    <article class="card">
+      <h3>Signing</h3>
+      <p>
+        The app binaries, the installer and its embedded uninstaller are all
+        signed with Azure Trusted Signing — SHA-256 and RFC-3161 timestamped —
+        so Windows knows where they came from.
+      </p>
+    </article>
+  </div>
+</section>
+
+<section id="build" class="split">
+  <div>
+    <h2>Build it yourself</h2>
+    <p>
+      WPF on .NET 10, driving the native <code>libsquish</code>
+      (<code>squish.dll</code>) through a thin P/Invoke layer.
+    </p>
+<pre><code>dotnet build -c Release
+dotnet run --project src -c Release
+
+<span class="c"># open an archive straight away</span>
+dotnet run --project src -c Release -- path\to\archive.sqsh
+
+<span class="c"># squish.dll somewhere else?</span>
+dotnet build -c Release -p:SquishDll=C:\path\to\squish.dll</code></pre>
+    <p class="note">
+      The installer needs Inno Setup 6.3+; then
+      <code>installer\build-installer.bat</code> produces
+      <code>build\winsquish-setup.exe</code>.
+    </p>
+  </div>
+  <div>
+    <h2>How it fits together</h2>
+<pre class="tree"><code>src/
+  Interop/     P/Invoke over squish.dll
+  Models/      entry list -&gt; browsable tree
+  Shell/       file types + Explorer verbs
+  ViewModels/  archive, navigation, async ops
+  Views/       toolbar · tree · details · overlay
+  Themes/      the light "fluent" theme
+installer/     Inno Setup script + signing</code></pre>
+    <p class="note">
+      Every libsquish call funnels through one wrapper that serializes them on
+      the handle. Open, extract and create run on a background thread and report
+      into a busy overlay. The entry index is read eagerly at open, so browsing
+      is instant and only extraction ever touches compressed data.
+    </p>
+  </div>
+</section>
+
+<section class="callout">
+  <h2>One honest caveat</h2>
+  <p>
+    SQUISH trades CPU for ratio — roughly 0.5–0.7&nbsp;MB/s, symmetric in both
+    directions. Extracting or creating a large archive takes real time, and the
+    progress overlay shows bytes and throughput so you can watch it happen.
+    What you get back is a much smaller file.
+  </p>
+</section>
+
+</main>
+
+<footer>
+  <div class="foot-inner">
+    <p>
+      <strong>WinSquish</strong> — GPL-3.0-or-later, matching SQUISH.
+      © 2026 Paige Julianne Sullivan.
+    </p>
+    <p class="links">
+      <a href="https://github.com/squish-compression/winsquish">Source</a>
+      <a href="https://github.com/squish-compression/winsquish/releases/latest">Releases</a>
+      <a href="https://github.com/squish-compression/winsquish/issues">Issues</a>
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
