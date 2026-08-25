@@ -54,6 +54,20 @@ WinSquish.exe --compress     path     # compress a file or folder to path.sqsh
 You can also click **“Make WinSquish the default for .sqsh files”** on the
 welcome screen to register for your account (no admin needed).
 
+## Website
+
+`docs/` holds a static one-page site (`index.html` + `style.css`, no build step,
+no JavaScript) covering the same ground as this README for people who aren't
+reading it on GitHub. It reuses `docs/screenshot.png` and the app icon, and its
+palette comes from `src/Themes/Styles.xaml` so the page and the app match.
+
+To publish it: **Settings → Pages → Deploy from a branch → `main` / `/docs`**.
+To preview it locally:
+
+```powershell
+python -m http.server 8000 --directory docs
+```
+
 ## Installer
 
 An [Inno Setup](https://jrsoftware.org/isinfo.php) installer builds a single
